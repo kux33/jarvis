@@ -2,62 +2,71 @@
 """
 ╔══════════════════════════════════════════╗
 ║          JARVIS - AI Agent               ║
-║   Compatible Raspberry Pi 5              ║
+║   Compatible Windows / Raspberry Pi 5    ║
 ║   Multi-LLM | Telegram Control           ║
 ╚══════════════════════════════════════════╝
 """
 
 import asyncio
 import logging
-import signal
 import sys
+import platform
 from pathlib import Path
+from dotenv import load_dotenv
 
-from core.agent import JarvisAgent
-from telegram.bot import JarvisTelegramBot
-from config.settings import Settings
+# Charger le .env AVANT tout le reste
+load_dotenv()
 
-# Setup logging
+# ── Logging UTF-8 (fix Windows cp1252) ────────────────────────
+Path("logs").mkdir(exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("logs/jarvis.log"),
-    ]
+        logging.StreamHandler(
+            stream=open(sys.stdout.fileno(), mode="w", encoding="utf-8", buffering=1)
+        ),
+        logging.FileHandler("logs/jarvis.log", encoding="utf-8"),
+    ],
 )
 logger = logging.getLogger("Jarvis.Main")
 
+# ── Imports JARVIS ─────────────────────────────────────────────
+from core.agent import JarvisAgent
+from tgbot.bot import JarvisTelegramBot
+from config.settings import Settings
+
 
 async def main():
-    logger.info("🤖 Démarrage de JARVIS...")
-    
-    # Charger la configuration
+    logger.info("JARVIS - Demarrage...")
+
     settings = Settings()
-    
-    # Créer l'agent IA
     agent = JarvisAgent(settings)
-    
-    # Initialisation asynchrone (chargement des skills)
     await agent.initialize()
-    
-    # Démarrer le bot Telegram
+
     bot = JarvisTelegramBot(agent, settings)
-    
-    logger.info(f"✅ JARVIS opérationnel | LLM actif: {settings.active_llm.upper()}")
-    
-    # Gestion propre de l'arrêt
-    loop = asyncio.get_running_loop()
-    
-    def shutdown():
-        logger.info("🔴 Arrêt de JARVIS...")
-        loop.stop()
-    
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, shutdown)
-    
-    await bot.run()
+
+    logger.info(f"JARVIS operationnel | LLM actif: {settings.active_llm.upper()}")
+
+    # Gestion arret compatible Windows + Linux
+    if platform.system() != "Windows":
+        import signal
+        loop = asyncio.get_running_loop()
+        stop_event = asyncio.Event()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, stop_event.set)
+
+    try:
+        await bot.run()
+    except KeyboardInterrupt:
+        logger.info("JARVIS - Arret demande (Ctrl+C)")
+    finally:
+        logger.info("JARVIS - Arret propre.")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

@@ -1,0 +1,30 @@
+# JARVIS - Dépendances Python
+# Compatible Raspberry Pi 5 (ARM64) + Python 3.11+
+
+# ──────────────────────────────
+# LLM Providers
+# ──────────────────────────────
+anthropic>=0.30.0          # Claude
+openai>=1.35.0             # OpenAI GPT + Grok + Kimi (compatible API)
+
+# ──────────────────────────────
+# Telegram
+# ──────────────────────────────
+python-telegram-bot>=21.0
+
+# ──────────────────────────────
+# Système & Monitoring
+# ──────────────────────────────
+psutil>=5.9.0              # CPU, RAM, température
+
+# ──────────────────────────────
+# Utilitaires
+# ──────────────────────────────
+python-dotenv>=1.0.0       # Chargement .env
+aiohttp>=3.9.0             # Requêtes HTTP async (skill météo)
+
+# ──────────────────────────────
+# Raspberry Pi (optionnel)
+# ──────────────────────────────
+# RPi.GPIO>=0.7.1          # GPIO (décommenter si nécessaire)
+# picamera2>=0.3.12        # Caméra (décommenter si nécessaire)

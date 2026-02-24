@@ -1,0 +1,2506 @@
+"""
+skill_pumpfun.py — JARVIS Skill : Scanner Memecoins Pump.fun (Solana)
+======================================================================
+Scan en temps réel les tokens en phase Pump.fun avant migration,
+applique des filtres stricts (style Kabuki), puis score chaque candidat
+via Claude API (0-100) avant d'envoyer une alerte Telegram.
+
+Commandes Telegram :
+  /pumpstart         — Démarrer le scanner
+  /pumpstop          — Arrêter le scanner
+  /pumpstatus        — État + dernières alertes + positions ouvertes
+  /pumpfilters       — Voir/modifier les filtres actifs
+  /pumplog           — 20 dernières alertes scorées
+  /pumpblacklist     — Lister les tokens blacklistés
+  /pumptest <addr>   — Analyser un token manuellement
+  /pumpmode fast|normal|deep — Changer la vitesse de scan
+  /pumptrademode paper|live|off — Activer/désactiver le trading auto
+  /pumptrades        — Positions ouvertes + P&L paper/live
+  /pumpclose <addr>  — Fermer manuellement une position
+  /pumppaperreset    — Remettre à zéro le paper trading
+  /pumpconfig        — Voir/modifier la config trading
+
+Variables d'environnement (.env) :
+  PUMP_SCAN_INTERVAL=120      — Secondes entre scans (défaut 120)
+  PUMP_MC_MIN=10000           — Market cap minimum ($)
+  PUMP_MC_MAX=20000           — Market cap maximum ($)
+  PUMP_VOLUME_MIN=25000       — Volume minimum ($)
+  PUMP_HOLDERS_MIN=70         — Holders minimum
+  PUMP_SNIPERS_MAX=10         — Snipers maximum
+  PUMP_DEV_HOLD_MAX=15        — Dev holdings max (%)
+  PUMP_TOP10_MAX=20           — Top 10 holders max (%)
+  PUMP_AGE_MAX_HOURS=2        — Âge max du token (heures)
+  PUMP_SCORE_ALERT=70         — Score minimum pour alerte
+  PUMP_SCORE_HIGH=85          — Score pour alerte high conviction
+  PUMP_MAX_ALERTS_PER_HOUR=10 — Anti-spam
+  PUMP_RUGCHECK_ENABLED=true  — Vérifier RugCheck.xyz
+  ANTHROPIC_API_KEY=...       — Clé API Anthropic
+  # Trading automatique
+  PUMP_TRADE_MODE=paper       — paper | live | off (défaut: paper)
+  PUMP_BUY_SCORE_MIN=70       — Score min pour buy auto (défaut 70)
+  PUMP_BUY_SCORE_HIGH=85      — Score high conviction (mise x2)
+  PUMP_BUY_AMOUNT=10          — Mise de base en USDC (défaut $10)
+  PUMP_BUY_AMOUNT_HIGH=20     — Mise high conviction en USDC (défaut $20)
+  PUMP_TP1=2.0                — Take profit 1 (x2, vendre 40%)
+  PUMP_TP2=3.0                — Take profit 2 (x3, vendre 35%)
+  PUMP_TP3=5.0                — Take profit 3 (x5, vendre 25%)
+  PUMP_SL=0.50                — Stop loss (50% de perte = -0.50)
+  PUMP_MAX_OPEN_TRADES=5      — Positions simultanées max
+  PUMP_MAX_DAILY_LOSS=50      — Perte journalière max avant pause ($)
+  PUMP_SOLANA_RPC=https://... — RPC Solana pour trades live
+  PUMP_WALLET_KEY=...         — Clé privée wallet (NE PAS PARTAGER)
+"""
+
+import asyncio
+import json
+import logging
+import os
+import time
+from datetime import datetime, timezone
+from typing import Optional
+
+import aiohttp
+from dotenv import load_dotenv
+from skills.base import BaseSkill, SkillContext
+try:
+    import websockets
+except ImportError:
+    websockets = None  # pip install websockets
+
+load_dotenv()
+logger = logging.getLogger("skill_pumpfun")
+
+# ── APIs ─────────────────────────────────────────────────────────
+PUMPPORTAL_WS     = "wss://pumpportal.fun/api/data"           # WebSocket officiel temps réel
+PUMPPORTAL_TRADE  = "https://pumpportal.fun/api/trade-local"
+PUMPFUN_API       = "https://frontend-api-v3.pump.fun"        # enrichissement par adresse
+DEXSCREENER_V1    = "https://api.dexscreener.com/token-pairs/v1/solana"
+DEXSCREENER_PAIRS = "https://api.dexscreener.com/latest/dex/tokens"
+RUGCHECK_API      = "https://api.rugcheck.xyz/v1"
+ANTHROPIC_API     = "https://api.anthropic.com/v1/messages"
+BIRDEYE_API       = "https://public-api.birdeye.so"
+COINGECKO_API     = "https://api.coingecko.com/api/v3"
+
+# ── Constantes ───────────────────────────────────────────────────
+SOLANA_CHAIN      = "solana"
+PUMP_FUN_PROGRAM  = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+
+
+# ══════════════════════════════════════════════════════════════════
+#   SKILL CLASS
+# ══════════════════════════════════════════════════════════════════
+
+class PumpFunSkill(BaseSkill):
+    """
+    Scanner de memecoins Pump.fun avec scoring Claude.
+    Intègre dans l'architecture JARVIS (handle / SkillContext).
+    """
+
+    SKILL_NAME    = "pumpfun"
+    SKILL_DESC    = "Scanner memecoins Pump.fun avec scoring Claude et trading auto"
+    SKILL_VERSION = "1.0.0"
+    SKILL_AUTHOR  = "JARVIS"
+
+    SKILL_COMMANDS = {
+        "pumpstart":      "Démarrer le scanner Pump.fun",
+        "pumpstop":       "Arrêter le scanner",
+        "pumpstatus":     "État + positions ouvertes + P&L",
+        "pumpfilters":    "Voir/modifier les filtres",
+        "pumplog":        "20 dernières alertes scorées",
+        "pumpblacklist":  "Gérer la blacklist tokens",
+        "pumptest":       "Analyser un token manuellement (`/pumptest <addr>`)",
+        "pumpmode":       "Vitesse de scan (`/pumpmode fast|normal|deep`)",
+        "pumptrademode":  "Mode trading (`/pumptrademode paper|live|off`)",
+        "pumptrades":     "Positions ouvertes + P&L paper/live",
+        "pumpclose":      "Fermer une position (`/pumpclose <addr>`)",
+        "pumppaperreset": "Remettre à zéro le paper trading",
+        "pumpconfig":     "Voir/modifier la config trading",
+        "pumpscanlog":    "Log détaillé des scans (`/pumpscanlog [N]`)",
+    }
+
+    # ── Init ────────────────────────────────────────────────────
+
+    def __init__(self, settings=None):
+        # Filtres configurables via .env
+        self.scan_interval    = int(os.getenv("PUMP_SCAN_INTERVAL", "120"))
+        self.mc_min           = float(os.getenv("PUMP_MC_MIN",        "10000"))
+        self.mc_max           = float(os.getenv("PUMP_MC_MAX",        "20000"))
+        self.volume_min       = float(os.getenv("PUMP_VOLUME_MIN",    "25000"))
+        self.holders_min      = int(os.getenv("PUMP_HOLDERS_MIN",     "70"))
+        self.snipers_max      = int(os.getenv("PUMP_SNIPERS_MAX",     "10"))
+        self.dev_hold_max     = float(os.getenv("PUMP_DEV_HOLD_MAX",  "15"))
+        self.top10_max        = float(os.getenv("PUMP_TOP10_MAX",     "20"))
+        self.age_max_hours    = float(os.getenv("PUMP_AGE_MAX_HOURS", "2"))
+        self.score_alert      = int(os.getenv("PUMP_SCORE_ALERT",     "70"))
+        self.score_high       = int(os.getenv("PUMP_SCORE_HIGH",      "85"))
+        self.max_alerts_hour  = int(os.getenv("PUMP_MAX_ALERTS_PER_HOUR", "10"))
+        self.rugcheck_enabled = os.getenv("PUMP_RUGCHECK_ENABLED", "true").lower() == "true"
+
+        # Clés API
+        self.anthropic_key    = os.getenv("ANTHROPIC_API_KEY", "")
+        self.solana_rpc       = os.getenv("PUMP_SOLANA_RPC", "https://api.mainnet-beta.solana.com")
+        self.wallet_key       = os.getenv("PUMP_WALLET_KEY", "")  # NE JAMAIS LOGGER
+
+        # ── Config trading auto ──────────────────────────────
+        self.trade_mode       = os.getenv("PUMP_TRADE_MODE", "paper")  # paper|live|off
+        self.buy_score_min    = int(os.getenv("PUMP_BUY_SCORE_MIN",    "70"))
+        self.buy_score_high   = int(os.getenv("PUMP_BUY_SCORE_HIGH",   "85"))
+        self.buy_amount       = float(os.getenv("PUMP_BUY_AMOUNT",     "10"))
+        self.buy_amount_high  = float(os.getenv("PUMP_BUY_AMOUNT_HIGH","20"))
+        self.tp1              = float(os.getenv("PUMP_TP1", "2.0"))   # x2 → vendre 40%
+        self.tp2              = float(os.getenv("PUMP_TP2", "3.0"))   # x3 → vendre 35%
+        self.tp3              = float(os.getenv("PUMP_TP3", "5.0"))   # x5 → vendre 25%
+        self.sl               = float(os.getenv("PUMP_SL",  "0.50"))  # -50%
+        self.max_open_trades  = int(os.getenv("PUMP_MAX_OPEN_TRADES", "5"))
+        self.max_daily_loss   = float(os.getenv("PUMP_MAX_DAILY_LOSS","50"))
+
+        # État interne
+        self._running         = False
+        self._loop_task       = None
+        self._context         = None
+        self._send_callback   = None
+
+        # Données
+        self._alerts_log: list   = []       # Toutes les alertes envoyées
+        self._scan_log: list     = []       # Log détaillé de chaque scan
+        self._seen_tokens: set   = set()    # Tokens déjà vus (déduplication)
+        self._blacklist: set     = set()    # Tokens manuellement blacklistés
+        self._scan_count: int    = 0
+        self._alerts_this_hour: list = []   # Timestamps des alertes (anti-spam)
+
+        # ── Positions de trading ─────────────────────────────
+        # Structure : addr → {symbol, entry_price, amount_usd, shares,
+        #                     opened_at, tp1_hit, tp2_hit, paper,
+        #                     score, conviction, sl_price}
+        self._positions: dict    = {}
+        self._closed_trades: list = []      # Historique des trades clôturés
+        self._daily_pnl: float   = 0.0     # P&L du jour (reset à minuit)
+        self._daily_pnl_date: str = ""     # Date du dernier reset
+        self._total_pnl: float   = 0.0     # P&L total
+
+        # Cache
+        self._token_cache: dict  = {}       # addr → {data, ts}
+        self._cache_ttl: int     = 60       # secondes
+
+        # ── PumpPortal WebSocket + Event-driven pipeline ──────
+        self._ws_task            = None     # asyncio Task du listener WS
+        self._ws_connected: bool = False
+        self._ws_sol_price: float = 0.0     # Prix SOL/USD mis en cache
+        self._ws_sol_price_ts: float = 0.0
+
+        # Queue événementielle : WS → workers (remplace le buffer passif)
+        self._token_queue: asyncio.Queue = asyncio.Queue(maxsize=500)
+        # Pool de workers concurrents pour enrichissement + scoring
+        self._worker_tasks: list = []
+        self._n_workers: int     = int(os.getenv("PUMP_WORKERS", "3"))
+        # TTL : ignorer un token si pas traité dans ce délai
+        self._ws_buffer_ttl: int = int(os.getenv("PUMP_TOKEN_TTL", "900"))  # 15min défaut
+        # Délai de polling MC pour attendre la zone cible (en secondes)
+        self._mc_poll_interval: float = float(os.getenv("PUMP_MC_POLL", "15"))
+        self._mc_poll_max: int        = int(os.getenv("PUMP_MC_POLL_MAX", "8"))  # max 8 polls = 2min
+
+        # Stats événementielles
+        self._stats_received:  int = 0   # tokens reçus du WS
+        self._stats_processed: int = 0   # tokens traités (enrichis)
+        self._stats_filtered:  int = 0   # tokens passant les filtres
+        self._stats_scored:    int = 0   # tokens scorés via Claude
+        self._stats_alerted:   int = 0   # alertes envoyées
+
+        # Ancien buffer conservé pour /pumpstatus compat
+        self._ws_buffer: list    = []    # juste pour affichage queue size
+
+        self._load_state()
+
+    # ── JARVIS Interface ─────────────────────────────────────────
+
+    async def handle(self, command: str, args: str, context) -> str:
+        self._context = context
+        if hasattr(context, "send_message"):
+            self._send_callback = context.send_message
+
+        routes = {
+            "pumpstart":      self._cmd_start,
+            "pumpstop":       self._cmd_stop,
+            "pumpstatus":     self._cmd_status,
+            "pumpfilters":    self._cmd_filters,
+            "pumplog":        self._cmd_log,
+            "pumpblacklist":  self._cmd_blacklist,
+            "pumptest":       self._cmd_test,
+            "pumpmode":       self._cmd_mode,
+            "pumptrademode":  self._cmd_trademode,
+            "pumptrades":     self._cmd_trades,
+            "pumpclose":      self._cmd_close,
+            "pumppaperreset": self._cmd_paper_reset,
+            "pumpconfig":     self._cmd_config,
+            "pumpscanlog":    self._cmd_scanlog,
+        }
+        handler = routes.get(command)
+        if handler:
+            try:
+                return await handler(args.strip(), context)
+            except Exception as e:
+                logger.error("Erreur commande %s: %s", command, e)
+                return "❌ Erreur : %s" % str(e)[:100]
+        return "❓ Commande inconnue : /%s" % command
+
+    # ══════════════════════════════════════════════════════════════
+    #   COMMANDES TELEGRAM
+    # ══════════════════════════════════════════════════════════════
+
+    async def _cmd_start(self, args: str, ctx: SkillContext) -> str:
+        if self._running:
+            return "⚠️ Scanner déjà actif. `/pumpstop` pour arrêter."
+        if not self.anthropic_key:
+            return (
+                "❌ **ANTHROPIC_API_KEY manquant**\n"
+                "Configure ta clé dans `.env` pour le scoring Claude.\n"
+                "Le scan peut quand même tourner (score désactivé)."
+            )
+        self._running        = True
+        self._token_queue    = asyncio.Queue(maxsize=500)
+        self._worker_tasks   = []
+        self._ws_task        = asyncio.create_task(self._ws_listener(ctx))
+        self._loop_task      = asyncio.create_task(self._main_loop(ctx))
+        # Lancer le pool de workers événementiels
+        for i in range(self._n_workers):
+            t = asyncio.create_task(self._token_worker(i, ctx))
+            self._worker_tasks.append(t)
+        trade_mode_str = {"paper": "📄 PAPER", "live": "💸 LIVE", "off": "🚫 OFF"}.get(self.trade_mode, "?")
+        poll_max_min   = self._mc_poll_interval * self._mc_poll_max / 60
+        return (
+            "⚡ **Scanner Pump.fun démarré — Mode événementiel !**\n"
+            "━━━━━━━━━━━━━━━\n"
+            "🔌 %d workers | WS PumpPortal temps réel\n"
+            "🎯 Zone MC: $%s–$%s | poll %.0fs × %d max (%.1fmin)\n"
+            "📋 Vol >$%s | Holders >%d | Snipers <%d | Dev <%.0f%%\n"
+            "🏷 Alerte score >%d | HC >%d | Trading: %s\n"
+            "   Mise $%.0f/$%.0f | TP x%.1f/x%.1f/x%.1f | SL -%.0f%%\n"
+            "⏱ TTL: %ds\n\n"
+            "💡 Latence cible: **10-30s** après création du token\n"
+            "`/pumpstatus` pour les stats temps réel"
+            % (
+                self._n_workers,
+                self._fmt_k(self.mc_min), self._fmt_k(self.mc_max),
+                self._mc_poll_interval, self._mc_poll_max, poll_max_min,
+                self._fmt_k(self.volume_min), self.holders_min,
+                self.snipers_max, self.dev_hold_max,
+                self.score_alert, self.score_high, trade_mode_str,
+                self.buy_amount, self.buy_amount_high,
+                self.tp1, self.tp2, self.tp3, self.sl * 100,
+                self._ws_buffer_ttl,
+            )
+        )
+
+    async def _cmd_stop(self, args: str, ctx: SkillContext) -> str:
+        if not self._running:
+            return "⚠️ Scanner pas actif."
+        self._running = False
+        if self._ws_task:
+            self._ws_task.cancel()
+            self._ws_task = None
+        if self._loop_task:
+            self._loop_task.cancel()
+            self._loop_task = None
+        for t in self._worker_tasks:
+            t.cancel()
+        self._worker_tasks = []
+        self._save_state()
+        return (
+            "🛑 **Scanner arrêté.**\n"
+            "━━━━━━━━━━━━━━━\n"
+            "📊 %d reçus → %d traités → %d filtrés → %d scorés → %d alertes\n"
+            "💡 `/pumpstart` pour reprendre"
+            % (self._stats_received, self._stats_processed,
+               self._stats_filtered, self._stats_scored, self._stats_alerted)
+        )
+
+    async def _cmd_status(self, args: str, ctx: SkillContext) -> str:
+        status    = "🟢 ACTIF" if self._running else "🔴 ARRÊTÉ"
+        ws_status = "🟢 connecté" if self._ws_connected else ("🔄 démarrage…" if self._running else "⚫ arrêté")
+        recent = self._alerts_log[-5:][::-1]
+
+        lines = [
+            "📡 **Pump.fun Scanner Status**\n━━━━━━━━━━━━━━━",
+            "🔘 Scanner: %s | WebSocket: %s" % (status, ws_status),
+            "⚡ Mode: événementiel | %d workers | TTL: %ds" % (self._n_workers, self._ws_buffer_ttl),
+            "📥 Queue: %d tokens en attente" % self._token_queue.qsize(),
+            "📊 Stats: %d reçus → %d traités → %d filtrés → %d scorés → %d alertes" % (
+                self._stats_received, self._stats_processed,
+                self._stats_filtered, self._stats_scored, self._stats_alerted),
+            "🔄 Scans effectués: %d" % self._scan_count,
+            "🚨 Alertes totales: %d" % len(self._alerts_log),
+            "🚫 Tokens blacklistés: %d" % len(self._blacklist),
+            "⏱ Prochaine alerte dans: %ds" % max(0, self.scan_interval - (int(time.time()) % self.scan_interval)),
+            "",
+            "📋 **Filtres actifs :**",
+            "  💰 MC: $%s–$%s" % (self._fmt_k(self.mc_min), self._fmt_k(self.mc_max)),
+            "  📈 Volume: >$%s" % self._fmt_k(self.volume_min),
+            "  👥 Holders: >%d" % self.holders_min,
+            "  🎯 Snipers: <%d | Dev: <%d%% | Top10: <%d%%" % (self.snipers_max, self.dev_hold_max, self.top10_max),
+            "  🕐 Âge max: %gh" % self.age_max_hours,
+        ]
+
+        if recent:
+            lines.append("\n🔔 **Dernières alertes :**")
+            for a in recent:
+                score = a.get("score", 0)
+                icon  = "🔴" if score >= self.score_high else "🟡"
+                lines.append(
+                    "%s **%s** ($%s) — Score: **%d/100** | %s"
+                    % (icon, a.get("symbol","?"), self._fmt_k(a.get("mc",0)),
+                       score, a.get("ts","?"))
+                )
+        else:
+            lines.append("\n📭 Aucune alerte pour l'instant.")
+
+        return "\n".join(lines)
+
+    async def _cmd_filters(self, args: str, ctx: SkillContext) -> str:
+        """Voir ou modifier un filtre : /pumpfilters mc_min 8000"""
+        if not args:
+            return (
+                "🎛 **Filtres Pump.fun actuels :**\n"
+                "━━━━━━━━━━━━━━━\n"
+                "`mc_min`        = $%s\n"
+                "`mc_max`        = $%s\n"
+                "`volume_min`    = $%s\n"
+                "`holders_min`   = %d\n"
+                "`snipers_max`   = %d\n"
+                "`dev_hold_max`  = %d%%\n"
+                "`top10_max`     = %d%%\n"
+                "`age_max_hours` = %.1fh\n"
+                "`score_alert`   = %d/100\n"
+                "`score_high`    = %d/100\n\n"
+                "Pour modifier : `/pumpfilters <clé> <valeur>`\n"
+                "Ex: `/pumpfilters mc_min 8000`"
+                % (
+                    self._fmt_k(self.mc_min), self._fmt_k(self.mc_max),
+                    self._fmt_k(self.volume_min), self.holders_min,
+                    self.snipers_max, self.dev_hold_max, self.top10_max,
+                    self.age_max_hours, self.score_alert, self.score_high,
+                )
+            )
+
+        parts = args.split()
+        if len(parts) != 2:
+            return "Usage: `/pumpfilters <clé> <valeur>`"
+
+        key, val_str = parts
+        filter_map = {
+            "mc_min":        ("mc_min",        float),
+            "mc_max":        ("mc_max",        float),
+            "volume_min":    ("volume_min",    float),
+            "holders_min":   ("holders_min",   int),
+            "snipers_max":   ("snipers_max",   int),
+            "dev_hold_max":  ("dev_hold_max",  float),
+            "top10_max":     ("top10_max",     float),
+            "age_max_hours": ("age_max_hours", float),
+            "score_alert":   ("score_alert",   int),
+            "score_high":    ("score_high",    int),
+        }
+        if key not in filter_map:
+            return "❌ Filtre inconnu. Utilise `/pumpfilters` pour voir les clés disponibles."
+
+        attr, cast = filter_map[key]
+        try:
+            setattr(self, attr, cast(val_str))
+            self._save_state()
+            return "✅ **%s** mis à jour → `%s`" % (key, val_str)
+        except ValueError:
+            return "❌ Valeur invalide : `%s`" % val_str
+
+    async def _cmd_log(self, args: str, ctx: SkillContext) -> str:
+        if not self._alerts_log:
+            return "📭 Aucune alerte pour l'instant.\n\n`/pumpstart` pour lancer le scanner."
+
+        lines = ["🔔 **Alertes Pump.fun (20 dernières)**\n━━━━━━━━━━━━━━━"]
+        for a in self._alerts_log[-20:][::-1]:
+            score    = a.get("score", 0)
+            icon     = "🔴" if score >= self.score_high else "🟡"
+            symbol   = a.get("symbol", "?")
+            mc       = self._fmt_k(a.get("mc", 0))
+            vol      = self._fmt_k(a.get("volume", 0))
+            holders  = a.get("holders", 0)
+            ts       = a.get("ts", "?")
+            verdict  = a.get("verdict", "")
+            addr     = a.get("address", "")
+            link     = "https://pump.fun/%s" % addr if addr else ""
+
+            lines.append(
+                "%s **%s** | $%s MC | $%s vol | %d holders\n"
+                "   Score: **%d/100** | %s\n"
+                "   %s | _%s_"
+                % (icon, symbol, mc, vol, holders, score, ts, link, verdict[:60])
+            )
+
+        return "\n\n".join(lines)
+
+    async def _cmd_blacklist(self, args: str, ctx: SkillContext) -> str:
+        """Gérer la blacklist : /pumpblacklist add <addr> | remove <addr> | list"""
+        parts = args.split()
+        if not parts or parts[0] == "list":
+            if not self._blacklist:
+                return "🚫 Blacklist vide."
+            lines = ["🚫 **Tokens blacklistés (%d) :**" % len(self._blacklist)]
+            for addr in list(self._blacklist)[:20]:
+                lines.append("  `%s`" % addr)
+            return "\n".join(lines)
+
+        if parts[0] == "add" and len(parts) >= 2:
+            addr = parts[1].strip()
+            self._blacklist.add(addr)
+            self._seen_tokens.add(addr)
+            self._save_state()
+            return "✅ `%s` ajouté à la blacklist." % addr
+
+        if parts[0] == "remove" and len(parts) >= 2:
+            addr = parts[1].strip()
+            self._blacklist.discard(addr)
+            self._save_state()
+            return "✅ `%s` retiré de la blacklist." % addr
+
+        return "Usage: `/pumpblacklist list|add <addr>|remove <addr>`"
+
+    async def _cmd_test(self, args: str, ctx: SkillContext) -> str:
+        """Analyser manuellement un token par son adresse"""
+        addr = args.strip()
+        if not addr:
+            return "Usage: `/pumptest <adresse_token>`"
+
+        await self._notify("🔍 Analyse de `%s`…" % addr[:20])
+
+        # Récupérer les données
+        token_data = await self._fetch_token_data(addr)
+        if not token_data:
+            return "❌ Impossible de récupérer les données pour `%s`\n\nVérifie l'adresse." % addr
+
+        # Afficher les données brutes
+        mc      = token_data.get("market_cap", 0)
+        vol     = token_data.get("volume_24h", 0)
+        holders = token_data.get("holders", 0)
+        symbol  = token_data.get("symbol", "?")
+        name    = token_data.get("name", "?")
+
+        raw_info = (
+            "📊 **%s** (%s)\n"
+            "━━━━━━━━━━━━━━━\n"
+            "💰 MC: $%s | Vol: $%s\n"
+            "👥 Holders: %d | Snipers: %s\n"
+            "🧑‍💻 Dev: %s%% | Top10: %s%%\n"
+            "🕐 Âge: %s\n"
+        ) % (
+            name, symbol,
+            self._fmt_k(mc), self._fmt_k(vol),
+            holders, token_data.get("snipers", "?"),
+            token_data.get("dev_holding_pct", "?"),
+            token_data.get("top10_pct", "?"),
+            token_data.get("age_str", "?"),
+        )
+        await self._notify(raw_info)
+
+        # Scoring Claude
+        if self.anthropic_key:
+            result = await self._score_with_claude(token_data)
+            score  = result.get("score", 0)
+            return await self._format_alert(token_data, result, force=True)
+        else:
+            return raw_info + "\n⚠️ ANTHROPIC_API_KEY non configurée → scoring désactivé"
+
+    async def _cmd_mode(self, args: str, ctx: SkillContext) -> str:
+        """Changer la vitesse de scan"""
+        modes = {
+            "fast":   60,
+            "normal": 120,
+            "deep":   300,
+        }
+        mode = args.strip().lower()
+        if mode not in modes:
+            return (
+                "Usage: `/pumpmode fast|normal|deep`\n"
+                "  `fast`   → scan toutes les 60s (plus d'alertes, plus d'appels API)\n"
+                "  `normal` → 120s (défaut)\n"
+                "  `deep`   → 300s (analyse approfondie, moins d'appels)"
+            )
+        self.scan_interval = modes[mode]
+        self._save_state()
+        return "✅ Mode **%s** activé — scan toutes les **%ds**" % (mode, modes[mode])
+
+    # ══════════════════════════════════════════════════════════════
+    #   BOUCLE PRINCIPALE
+    # ══════════════════════════════════════════════════════════════
+
+    async def _main_loop(self, ctx: SkillContext):
+        """
+        Boucle principale allégée — plus de scan cyclique.
+        Se charge uniquement de :
+        - Surveiller les positions ouvertes (TP/SL) toutes les 30s
+        - Reset P&L journalier
+        - Maintenir les stats de session
+        Le traitement des tokens est géré par les workers événementiels.
+        """
+        self._context = ctx
+        logger.info("Main loop démarrée — monitoring positions toutes les 30s")
+
+        while self._running:
+            try:
+                await asyncio.sleep(30)
+
+                if self._positions and self.trade_mode != "off":
+                    await self._monitor_positions()
+
+                self._check_daily_reset()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Erreur main loop: %s", e)
+                await asyncio.sleep(10)
+
+        logger.info("Main loop arrêtée")
+
+    async def _ws_listener(self, ctx: SkillContext):
+        """
+        WebSocket PumpPortal — réception événementielle.
+        Chaque token créé est immédiatement poussé dans _token_queue
+        pour traitement par les workers concurrents.
+        """
+        RECONNECT_DELAY = 5
+
+        if websockets is None:
+            logger.error("websockets non installé — pip install websockets --break-system-packages")
+            await self._notify("❌ `pip install websockets --break-system-packages`")
+            return
+
+        while self._running:
+            try:
+                logger.info("Connexion WebSocket PumpPortal → %s", PUMPPORTAL_WS)
+                async with websockets.connect(
+                    PUMPPORTAL_WS,
+                    ping_interval=20,
+                    ping_timeout=10,
+                    close_timeout=5,
+                ) as ws:
+                    self._ws_connected = True
+                    logger.info("✅ WebSocket PumpPortal connecté — mode événementiel")
+                    await ws.send(json.dumps({"method": "subscribeNewToken"}))
+
+                    async for raw in ws:
+                        if not self._running:
+                            break
+                        try:
+                            msg = json.loads(raw)
+                        except Exception:
+                            continue
+
+                        if msg.get("txType") != "create":
+                            continue
+
+                        mint = msg.get("mint", "")
+                        if not mint or mint in self._blacklist:
+                            continue
+                        # Déduplication légère : éviter de remettre en queue un token déjà traité
+                        if mint in self._seen_tokens:
+                            continue
+
+                        sol_px = await self._get_sol_price()
+                        mc_sol = float(msg.get("marketCapSol", 0) or 0)
+
+                        token = {
+                            "address":           mint,
+                            "symbol":            msg.get("symbol", "?"),
+                            "name":              msg.get("name", "?"),
+                            "market_cap":        mc_sol * sol_px,
+                            "mc_sol":            mc_sol,
+                            "volume_24h":        float(msg.get("solAmount", 0) or 0) * sol_px,
+                            "holders":           0,
+                            "created_ts":        int(time.time()),
+                            "age_hours":         0.0,
+                            "age_str":           "< 1min",
+                            "uri":               msg.get("uri", ""),
+                            "bonding_curve_key": msg.get("bondingCurveKey", ""),
+                            "v_sol_bonding":     float(msg.get("vSolInBondingCurve", 0) or 0),
+                            "trader_key":        msg.get("traderPublicKey", ""),
+                            "_source":           "pumpportal_ws",
+                            "_queued_at":        time.time(),
+                        }
+
+                        self._stats_received += 1
+                        try:
+                            self._token_queue.put_nowait(token)
+                            logger.info("Queue ← %s (%s) $%.0f | qsize=%d",
+                                        token["symbol"], mint[:8],
+                                        token["market_cap"], self._token_queue.qsize())
+                        except asyncio.QueueFull:
+                            logger.warning("Queue PLEINE (%d), token %s dropé",
+                                           self._token_queue.maxsize, mint[:8])
+                        except Exception as e:
+                            logger.error("put_nowait ERREUR %s: %s", mint[:8], e)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self._ws_connected = False
+                logger.warning("WS déconnecté: %s — reconnexion dans %ds", e, RECONNECT_DELAY)
+                await asyncio.sleep(RECONNECT_DELAY)
+
+        self._ws_connected = False
+        logger.info("WebSocket PumpPortal arrêté")
+
+    async def _get_sol_price(self) -> float:
+        """Prix SOL/USD mis en cache 5 minutes."""
+        if (self._ws_sol_price > 0
+                and time.time() - self._ws_sol_price_ts < 300):
+            return self._ws_sol_price
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    "%s/simple/price" % COINGECKO_API,
+                    params={"ids": "solana", "vs_currencies": "usd"},
+                    timeout=aiohttp.ClientTimeout(total=6),
+                ) as r:
+                    if r.status == 200:
+                        data  = await r.json(content_type=None)
+                        price = float(data.get("solana", {}).get("usd", 0) or 0)
+                        if price > 0:
+                            self._ws_sol_price    = price
+                            self._ws_sol_price_ts = time.time()
+                            return price
+        except Exception as e:
+            logger.debug("get_sol_price: %s", e)
+        return self._ws_sol_price or 150.0
+
+    async def _token_worker(self, worker_id: int, ctx: SkillContext):
+        """
+        Worker événementiel — cœur de la nouvelle architecture.
+
+        Pour chaque token reçu de la queue :
+        1. Vérifier le TTL (ignorer si trop vieux)
+        2. Attendre que le MC entre dans la zone cible (polling Pump.fun)
+        3. Enrichir (holders, snipers, dev%, rugcheck)
+        4. Appliquer les filtres stricts
+        5. Scorer via Claude
+        6. Alerter si score suffisant
+
+        Plusieurs workers tournent en parallèle → pas de blocage.
+        """
+        self._context = ctx
+        logger.info("Worker #%d démarré — en attente de tokens sur la queue", worker_id)
+        _worker_loop_count = 0
+
+        while self._running:
+            try:
+                # Attendre un token avec timeout pour pouvoir checker _running
+                try:
+                    token = await asyncio.wait_for(self._token_queue.get(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    _worker_loop_count += 1
+                    if _worker_loop_count % 12 == 0:  # log toutes les minutes
+                        logger.info("W#%d alive | queue=%d | reçus=%d traités=%d",
+                                    worker_id, self._token_queue.qsize(),
+                                    self._stats_received, self._stats_processed)
+                    continue
+
+                mint   = token.get("address", "")
+                symbol = token.get("symbol", "?")
+                logger.info("W#%d ← token dépilé: %s (%s) | queue restante=%d",
+                            worker_id, symbol, mint[:8], self._token_queue.qsize())
+
+                # ── 1. Vérifier TTL ──────────────────────────────
+                age = time.time() - token.get("_queued_at", time.time())
+                if age > self._ws_buffer_ttl:
+                    logger.debug("W#%d TTL expiré %s (%.0fs)", worker_id, mint[:8], age)
+                    self._token_queue.task_done()
+                    continue
+
+                # Déduplication inter-workers
+                if mint in self._seen_tokens:
+                    self._token_queue.task_done()
+                    continue
+                # Marquer immédiatement pour éviter double-traitement par autre worker
+                self._seen_tokens.add(mint)
+
+                logger.info("W#%d → %s (%s) $%.0f | queue=%d",
+                            worker_id, symbol, mint[:8],
+                            token.get("market_cap", 0), self._token_queue.qsize())
+
+                # ── 2. Polling MC — attendre la zone cible ────────
+                # Les tokens sont créés à ~$2-3K, on attend $10K-$20K
+                token_data = await self._poll_until_mc_zone(token, worker_id)
+
+                if token_data is None:
+                    # N'est jamais entré dans la zone ou TTL dépassé
+                    logger.debug("W#%d %s n'a pas atteint la zone MC en temps voulu", worker_id, mint[:8])
+                    self._token_queue.task_done()
+                    continue
+
+                self._stats_processed += 1
+
+                # ── 3. Enrichissement complet ─────────────────────
+                enriched = await self._enrich_token(token_data)
+                if not enriched:
+                    self._token_queue.task_done()
+                    continue
+
+                # ── 4. Filtres stricts ────────────────────────────
+                ok, reason = self._apply_filters(enriched)
+                if not ok:
+                    logger.info("W#%d filtre: %s — %s", worker_id, symbol, reason)
+                    self._token_queue.task_done()
+                    continue
+
+                self._stats_filtered += 1
+                logger.info("W#%d ✅ CANDIDAT: %s $%.0f %dh %ds",
+                            worker_id, symbol,
+                            enriched.get("market_cap", 0),
+                            enriched.get("holders", 0),
+                            enriched.get("snipers", 0))
+
+                # ── 5. Scoring Claude ─────────────────────────────
+                result = await self._score_with_claude(enriched)
+                score  = result.get("score", 0)
+                self._stats_scored += 1
+
+                # Enregistrer dans scan_log (format compatible)
+                self._scan_count += 1
+                self._scan_log.append({
+                    "num":        self._scan_count,
+                    "ts":         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "elapsed_s":  round(time.time() - token.get("_queued_at", time.time()), 1),
+                    "buf_tokens": 1,
+                    "candidates": 1,
+                    "scored":     [{
+                        "symbol":  enriched.get("symbol", "?"),
+                        "address": mint,
+                        "mc":      enriched.get("market_cap", 0),
+                        "holders": enriched.get("holders", 0),
+                        "score":   score,
+                        "verdict": result.get("verdict", ""),
+                        "rec":     result.get("recommendation", ""),
+                        "alerted": score >= self.score_alert,
+                    }],
+                    "ws": self._ws_connected,
+                    "worker": worker_id,
+                })
+                if len(self._scan_log) > 200:
+                    self._scan_log = self._scan_log[-200:]
+
+                # ── 6. Alerte ─────────────────────────────────────
+                if score >= self.score_alert:
+                    self._stats_alerted += 1
+                    await self._send_alert(enriched, result)
+
+                self._token_queue.task_done()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("W#%d erreur: %s", worker_id, e)
+                try:
+                    self._token_queue.task_done()
+                except Exception:
+                    pass
+
+        logger.info("Worker #%d arrêté", worker_id)
+
+    async def _poll_until_mc_zone(self, token: dict, worker_id: int) -> Optional[dict]:
+        """
+        Interroge Pump.fun toutes les N secondes jusqu'à ce que le MC
+        entre dans la zone cible [mc_min, mc_max], ou abandon après max polls.
+
+        Retourne le token enrichi avec le MC actuel, ou None si hors zone.
+        """
+        mint   = token.get("address", "")
+        symbol = token.get("symbol", "?")
+
+        for poll_n in range(self._mc_poll_max):
+            # Vérifier TTL global
+            age = time.time() - token.get("_queued_at", time.time())
+            if age > self._ws_buffer_ttl:
+                return None
+
+            # Récupérer le MC actuel depuis Pump.fun
+            pf = await self._fetch_pumpfun_coin(mint)
+            if pf:
+                mc_usd = float(pf.get("usd_market_cap", 0) or 0)
+                token["market_cap"] = mc_usd
+
+                logger.debug("W#%d poll[%d] %s MC=$%.0f (zone $%.0f-$%.0f)",
+                             worker_id, poll_n, symbol,
+                             mc_usd, self.mc_min, self.mc_max)
+
+                if self.mc_min <= mc_usd <= self.mc_max:
+                    # ✅ Dans la zone — on enrichit complètement depuis cette réponse
+                    sol_px = await self._get_sol_price()
+                    token.update({
+                        "holders":         int(pf.get("holder_count", 0) or 0),
+                        "snipers":         int(pf.get("sniper_count", pf.get("bot_holder_count", 0)) or 0),
+                        "dev_holding_pct": float(pf.get("creator_percentage", 0) or 0),
+                        "top10_pct":       float(pf.get("top10_pct", 0) or 0),
+                        "reply_count":     int(pf.get("reply_count", 0) or 0),
+                        "bonding_curve_pct": float(pf.get("bonding_curve_percentage", 0) or 0),
+                        "description":     pf.get("description", token.get("description", "")),
+                        "twitter":         pf.get("twitter", ""),
+                        "telegram":        pf.get("telegram", ""),
+                        "website":         pf.get("website", ""),
+                        "volume_24h":      float(pf.get("volume", 0) or 0),
+                        "_source":         "pumpportal_ws",
+                    })
+                    logger.info("W#%d 🎯 Zone MC atteinte: %s $%.0f après %d polls (%.0fs)",
+                                worker_id, symbol, mc_usd, poll_n,
+                                time.time() - token["_queued_at"])
+                    return token
+
+                elif mc_usd > self.mc_max * 2:
+                    # A déjà trop pumpé — plus la peine d'attendre
+                    logger.debug("W#%d %s déjà trop haut ($%.0f > $%.0f) — abandon",
+                                 worker_id, symbol, mc_usd, self.mc_max * 2)
+                    return None
+
+            # Attendre avant le prochain poll
+            await asyncio.sleep(self._mc_poll_interval)
+
+        # Max polls atteint sans entrer dans la zone
+        return None
+
+
+    async def _run_scan(self) -> list:
+        """Obsolète en mode événementiel — conservé pour compatibilité /pumptest"""
+        return []
+
+
+    async def _fetch_pump_tokens(self) -> list:
+        """Obsolète en mode événementiel — conservé pour compatibilité"""
+        return []
+
+
+    def _normalize_pumpfun_coin(self, c: dict) -> Optional[dict]:
+        """Normalise un coin Pump.fun en format interne standard"""
+        addr = c.get("mint", c.get("address", ""))
+        if not addr:
+            return None
+        mc = float(c.get("usd_market_cap", c.get("market_cap", 0)) or 0)
+        return {
+            "address":       addr,
+            "symbol":        c.get("symbol", "?"),
+            "name":          c.get("name", "?"),
+            "market_cap":    mc,
+            "volume_24h":    float(c.get("volume", 0) or 0),
+            "holders":       int(c.get("holder_count", 0) or 0),
+            "snipers":       int(c.get("sniper_count", c.get("bot_holder_count", 0)) or 0),
+            "dev_holding_pct": float(c.get("creator_percentage", c.get("dev_holding_pct", 0)) or 0),
+            "top10_pct":     float(c.get("top10_pct", 0) or 0),
+            "reply_count":   int(c.get("reply_count", 0) or 0),
+            "bonding_curve_pct": float(c.get("bonding_curve_percentage", 0) or 0),
+            "description":   c.get("description", ""),
+            "image_uri":     c.get("image_uri", ""),
+            "twitter":       c.get("twitter", ""),
+            "telegram":      c.get("telegram", ""),
+            "website":       c.get("website", ""),
+            "created_ts":    int(c.get("created_timestamp", 0) or 0),
+            "last_trade_ts": int(c.get("last_trade_timestamp", 0) or 0),
+            "_source":       "pumpfun",
+        }
+
+    def _normalize_gmgn_pair(self, p: dict) -> Optional[dict]:
+        """Normalise un pair GMGN en format interne standard"""
+        addr = p.get("address", p.get("token_address", p.get("base_address", "")))
+        if not addr:
+            return None
+        return {
+            "address":    addr,
+            "symbol":     p.get("symbol", "?"),
+            "name":       p.get("name", "?"),
+            "market_cap": float(p.get("market_cap", p.get("usd_market_cap", 0)) or 0),
+            "volume_24h": float(p.get("volume", p.get("volume_24h", 0)) or 0),
+            "holders":    int(p.get("holder_count", p.get("holder", 0)) or 0),
+            "snipers":    int(p.get("sniper_count", 0) or 0),
+            "dev_holding_pct": float(p.get("dev_hold", p.get("creator_percentage", 0)) or 0),
+            "top10_pct":  float(p.get("top10_holder_rate", 0) or 0) * 100,
+            "created_ts": int(p.get("open_timestamp", p.get("created_timestamp", 0)) or 0),
+            "description": p.get("description", ""),
+            "twitter":    p.get("twitter", ""),
+            "telegram":   p.get("telegram", ""),
+            "website":    p.get("website", ""),
+            "_source":    "gmgn",
+        }
+
+    async def _enrich_token(self, token: dict) -> Optional[dict]:
+        """
+        Enrichit un token avec les données manquantes :
+        - Holders count (si manquant)
+        - Snipers count
+        - Dev holding %
+        - Top 10 holders %
+        - Age en heures
+        - RugCheck score
+        """
+        addr = token.get("address", "")
+        if not addr:
+            return None
+
+        # Vérifier le cache
+        cached = self._token_cache.get(addr)
+        if cached and time.time() - cached["ts"] < self._cache_ttl:
+            return cached["data"]
+
+        t = dict(token)  # Copie
+
+        now = int(time.time())
+
+        # ── Âge du token ─────────────────────────────────────
+        created_ts = t.get("created_ts", 0)
+        if created_ts:
+            age_s = now - created_ts
+            t["age_hours"] = age_s / 3600
+            t["age_str"]   = self._fmt_duration(age_s)
+        else:
+            t["age_hours"] = 0
+            t["age_str"]   = "?"
+
+        # ── Pour les tokens WS, rafraîchir le MC depuis Pump.fun ─
+        # Le marketCapSol reçu = MC à la CRÉATION (~$2-3K)
+        # On veut le MC ACTUEL pour les filtres ($10K-$20K sweet spot)
+        if t.get("_source") == "pumpportal_ws":
+            pf_data = await self._fetch_pumpfun_coin(t["address"])
+            if pf_data:
+                mc_fresh = float(pf_data.get("usd_market_cap", 0) or 0)
+                if mc_fresh > 0:
+                    t["market_cap"] = mc_fresh
+                    logger.debug("MC rafraîchi %s: $%.0f → $%.0f",
+                                 t["address"][:8], t.get("mc_sol", 0) * 150, mc_fresh)
+
+        # ── Données Pump.fun spécifiques ─────────────────────
+        if not t.get("holders") or t.get("_source") != "pumpfun":
+            pf_data = await self._fetch_pumpfun_coin(addr)
+            if pf_data:
+                t.update({
+                    "holders":        pf_data.get("holder_count", t.get("holders", 0)),
+                    "snipers":        pf_data.get("sniper_count", pf_data.get("bot_holder_count", 0)),
+                    "dev_holding_pct": pf_data.get("dev_holding_pct", pf_data.get("creator_percentage", 0)),
+                    "top10_pct":      pf_data.get("top10_pct", 0),
+                    "reply_count":    pf_data.get("reply_count", 0),
+                    "description":    pf_data.get("description", t.get("description", "")),
+                    "twitter":        pf_data.get("twitter", t.get("twitter", "")),
+                    "telegram":       pf_data.get("telegram", t.get("telegram", "")),
+                    "website":        pf_data.get("website", t.get("website", "")),
+                    "bonding_curve_pct": pf_data.get("bonding_curve_percentage", 0),
+                    "king_of_hill_ts": pf_data.get("king_of_hill_timestamp", 0),
+                    "market_cap":     pf_data.get("usd_market_cap", t.get("market_cap", 0)),
+                })
+
+        # ── RugCheck score ────────────────────────────────────
+        if self.rugcheck_enabled:
+            rug = await self._fetch_rugcheck(addr)
+            if rug:
+                t["rugcheck_score"] = rug.get("score", 0)
+                t["rugcheck_risks"]  = rug.get("risks", [])
+            else:
+                t["rugcheck_score"] = None
+                t["rugcheck_risks"]  = []
+
+        # Defaults sécurisés
+        t.setdefault("snipers", 0)
+        t.setdefault("dev_holding_pct", 0)
+        t.setdefault("top10_pct", 0)
+        t.setdefault("bonding_curve_pct", 0)
+        t.setdefault("reply_count", 0)
+        t.setdefault("rugcheck_score", None)
+
+        # Mettre en cache
+        self._token_cache[addr] = {"data": t, "ts": time.time()}
+        return t
+
+    async def _fetch_pumpfun_coin(self, addr: str) -> Optional[dict]:
+        """Récupère les détails d'un token depuis l'API Pump.fun"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    "%s/coins/%s" % (PUMPFUN_API, addr),
+                    timeout=aiohttp.ClientTimeout(total=10),
+                    headers={"User-Agent": "Mozilla/5.0"},
+                ) as r:
+                    if r.status == 200:
+                        return await r.json(content_type=None)
+        except Exception as e:
+            logger.debug("fetch_pumpfun_coin %s: %s", addr[:16], e)
+        return None
+
+    async def _fetch_rugcheck(self, addr: str) -> Optional[dict]:
+        """Récupère le RugCheck score d'un token Solana"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    "%s/tokens/%s/report/summary" % (RUGCHECK_API, addr),
+                    timeout=aiohttp.ClientTimeout(total=8),
+                    headers={"User-Agent": "Mozilla/5.0"},
+                ) as r:
+                    if r.status == 200:
+                        data = await r.json(content_type=None)
+                        # RugCheck retourne un score et des risques
+                        return {
+                            "score": data.get("score", data.get("riskScore", 0)),
+                            "risks": [
+                                r.get("name", str(r)) for r in data.get("risks", [])
+                            ][:5],
+                        }
+        except Exception as e:
+            logger.debug("fetch_rugcheck %s: %s", addr[:16], e)
+        return None
+
+    async def _fetch_token_data(self, addr: str) -> Optional[dict]:
+        """Fetch complet pour /pumptest"""
+        token = {"address": addr, "_source": "manual"}
+        pf    = await self._fetch_pumpfun_coin(addr)
+        if pf:
+            now    = int(time.time())
+            age_s  = now - int(pf.get("created_timestamp", now) or now)
+            token.update({
+                "symbol":          pf.get("symbol", "?"),
+                "name":            pf.get("name", "?"),
+                "market_cap":      float(pf.get("usd_market_cap", 0) or 0),
+                "volume_24h":      float(pf.get("volume", 0) or 0),
+                "holders":         int(pf.get("holder_count", 0) or 0),
+                "snipers":         int(pf.get("sniper_count", pf.get("bot_holder_count", 0)) or 0),
+                "dev_holding_pct": float(pf.get("creator_percentage", pf.get("dev_holding_pct", 0)) or 0),
+                "top10_pct":       float(pf.get("top10_pct", 0) or 0),
+                "reply_count":     int(pf.get("reply_count", 0) or 0),
+                "bonding_curve_pct": float(pf.get("bonding_curve_percentage", 0) or 0),
+                "description":     pf.get("description", ""),
+                "twitter":         pf.get("twitter", ""),
+                "telegram":        pf.get("telegram", ""),
+                "website":         pf.get("website", ""),
+                "image_uri":       pf.get("image_uri", ""),
+                "created_ts":      int(pf.get("created_timestamp", 0) or 0),
+                "age_hours":       age_s / 3600,
+                "age_str":         self._fmt_duration(age_s),
+                "_source":         "pumpfun",
+            })
+            if self.rugcheck_enabled:
+                rug = await self._fetch_rugcheck(addr)
+                if rug:
+                    token["rugcheck_score"] = rug.get("score")
+                    token["rugcheck_risks"]  = rug.get("risks", [])
+            return token
+        return None
+
+    # ══════════════════════════════════════════════════════════════
+    #   SCORING CLAUDE
+    # ══════════════════════════════════════════════════════════════
+
+    async def _score_with_claude(self, t: dict) -> dict:
+        """
+        Envoie les données du token à Claude pour analyse et scoring 0-100.
+        Retourne : {score, verdict, breakdown, recommendation}
+        """
+        if not self.anthropic_key:
+            return {
+                "score": 0, "verdict": "API key manquante",
+                "breakdown": {}, "recommendation": "Configurer ANTHROPIC_API_KEY"
+            }
+
+        # ── Construire le prompt structuré ────────────────────
+        addr           = t.get("address", "")
+        symbol         = t.get("symbol", "?")
+        name           = t.get("name", "?")
+        mc             = t.get("market_cap", 0)
+        vol            = t.get("volume_24h", 0)
+        holders        = t.get("holders", 0)
+        snipers        = t.get("snipers", "N/A")
+        dev_pct        = t.get("dev_holding_pct", "N/A")
+        top10          = t.get("top10_pct", "N/A")
+        age_str        = t.get("age_str", "?")
+        bc_pct         = t.get("bonding_curve_pct", 0)
+        reply_count    = t.get("reply_count", 0)
+        description    = t.get("description", "")[:300]
+        twitter        = t.get("twitter", "")
+        telegram       = t.get("telegram", "")
+        website        = t.get("website", "")
+        rug_score      = t.get("rugcheck_score", "N/A")
+        rug_risks      = ", ".join(t.get("rugcheck_risks", [])) or "aucun détecté"
+        vol_per_holder = vol / holders if holders > 0 else 0
+
+        prompt = """Tu es un expert en analyse de memecoins sur Pump.fun (Solana). Tu dois scorer ce token de 0 à 100.
+
+## Token à analyser
+- **Ticker/Name**: %s / %s
+- **Adresse**: %s
+- **Âge**: %s
+- **Market Cap**: $%s
+- **Volume 24h**: $%s (ratio vol/holder: $%.0f)
+- **Holders**: %d
+- **Snipers**: %s
+- **Dev Holdings**: %s%%
+- **Top 10 Holders**: %s%%
+- **Bonding Curve**: %.1f%%
+- **Replies Pump.fun**: %d
+- **RugCheck Score**: %s (risques: %s)
+- **Liens**: Twitter=%s | TG=%s | Site=%s
+- **Description/Narrative**: %s
+
+## Critères de scoring (total 100 pts)
+
+### 1. Engagement organique vs bot/spam (30 pts)
+Évalue si l'activité est réelle : ratio volume/holders, nombre de replies, diversité des wallets, absence de wash trading évident.
+
+### 2. Potentiel viral / thème fort (30 pts)
+Analyse le nom, ticker, description, narrative. Est-ce un thème d'actualité ? Artwork mémorable ? Timing bon ? Lien avec une tendance culturelle/crypto ?
+
+### 3. Risque rug / concentration wallets (20 pts)
+Dev holdings, top 10 concentration, snipers, RugCheck risks, signaux d'alerte.
+
+### 4. Momentum (20 pts)
+Volume croissant vs MC, bonding curve progression, replies récents, signes de croissance organique.
+
+## Format de réponse (JSON strict, aucun texte avant ou après)
+{
+  "score": <0-100>,
+  "breakdown": {
+    "engagement_organique": <0-30>,
+    "potentiel_viral": <0-30>,
+    "risque_rug": <0-20>,
+    "momentum": <0-20>
+  },
+  "verdict": "<1 phrase résumant le verdict>",
+  "points_forts": ["<point 1>", "<point 2>"],
+  "points_faibles": ["<point 1>", "<point 2>"],
+  "recommendation": "<BUY EARLY|WATCH|SKIP|HIGH RISK>",
+  "tp_targets": ["x2", "x3"],
+  "sl_suggestion": "-40%%",
+  "raisonnement": "<2-3 phrases d'analyse clé>"
+}""" % (
+            symbol, name, addr[:20] + "...",
+            age_str,
+            self._fmt_k(mc), self._fmt_k(vol), vol_per_holder,
+            holders, snipers, dev_pct, top10,
+            bc_pct, reply_count,
+            rug_score, rug_risks,
+            twitter or "non", telegram or "non", website or "non",
+            description or "Aucune description",
+        )
+
+        # ── Appel API Anthropic ───────────────────────────────
+        try:
+            headers = {
+                "x-api-key":         self.anthropic_key,
+                "anthropic-version": "2023-06-01",
+                "content-type":      "application/json",
+            }
+            payload = {
+                "model":      "claude-sonnet-4-6",
+                "max_tokens": 800,
+                "messages":   [{"role": "user", "content": prompt}],
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    ANTHROPIC_API,
+                    json=payload,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as r:
+                    if r.status != 200:
+                        body = await r.text()
+                        logger.error("Claude API %d: %s", r.status, body[:200])
+                        return {"score": 0, "verdict": "Erreur API Claude", "breakdown": {}, "recommendation": "SKIP"}
+
+                    data    = await r.json()
+                    content = data.get("content", [{}])[0].get("text", "")
+
+                    # Parser le JSON retourné par Claude
+                    clean = content.strip()
+                    if clean.startswith("```"):
+                        clean = clean.split("```")[1]
+                        if clean.startswith("json"):
+                            clean = clean[4:]
+                    clean = clean.strip()
+
+                    result = json.loads(clean)
+                    logger.info(
+                        "Score Claude %s (%s): %d/100 — %s",
+                        symbol, addr[:8], result.get("score", 0), result.get("verdict", "")
+                    )
+                    return result
+
+        except json.JSONDecodeError as e:
+            logger.error("JSON parse error Claude: %s | response: %s", e, content[:200])
+            return {"score": 0, "verdict": "Erreur parsing réponse", "breakdown": {}, "recommendation": "SKIP"}
+        except Exception as e:
+            logger.error("Erreur appel Claude: %s", e)
+            return {"score": 0, "verdict": "Erreur API", "breakdown": {}, "recommendation": "SKIP"}
+
+    # ══════════════════════════════════════════════════════════════
+    #   ALERTES
+    # ══════════════════════════════════════════════════════════════
+
+    async def _send_alert(self, token_data: dict, result: dict):
+        """Envoie une alerte Telegram pour un token scoré"""
+
+        # Anti-spam : max N alertes par heure
+        now = time.time()
+        self._alerts_this_hour = [t for t in self._alerts_this_hour if now - t < 3600]
+        if len(self._alerts_this_hour) >= self.max_alerts_hour:
+            logger.warning("Anti-spam: limite %d alertes/heure atteinte", self.max_alerts_hour)
+            return
+
+        self._alerts_this_hour.append(now)
+
+        msg = await self._format_alert(token_data, result)
+
+        # Logger
+        addr = token_data.get("address", "")
+        self._alerts_log.append({
+            "ts":      datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "address": addr,
+            "symbol":  token_data.get("symbol", "?"),
+            "mc":      token_data.get("market_cap", 0),
+            "volume":  token_data.get("volume_24h", 0),
+            "holders": token_data.get("holders", 0),
+            "score":   result.get("score", 0),
+            "verdict": result.get("verdict", ""),
+        })
+        self._save_state()
+
+        await self._notify(msg)
+
+        # ── Trading automatique après alerte ─────────────────
+        if self.trade_mode != "off":
+            await self._auto_trade(token_data, result)
+
+    async def _format_alert(self, t: dict, result: dict, force: bool = False) -> str:
+        """Formate le message d'alerte complet"""
+        score    = result.get("score", 0)
+        verdict  = result.get("verdict", "")
+        rec      = result.get("recommendation", "")
+        points_f = result.get("points_forts", [])
+        points_w = result.get("points_faibles", [])
+        raison   = result.get("raisonnement", "")
+        tp       = result.get("tp_targets", ["x2", "x3"])
+        sl       = result.get("sl_suggestion", "-40%")
+        breakdown = result.get("breakdown", {})
+
+        addr    = t.get("address", "")
+        symbol  = t.get("symbol", "?")
+        name    = t.get("name", "?")
+        mc      = t.get("market_cap", 0)
+        vol     = t.get("volume_24h", 0)
+        holders = t.get("holders", 0)
+        snipers = t.get("snipers", "?")
+        dev_pct = t.get("dev_holding_pct", "?")
+        top10   = t.get("top10_pct", "?")
+        age_str = t.get("age_str", "?")
+        bc_pct  = t.get("bonding_curve_pct", 0)
+        desc    = t.get("description", "")[:80]
+        rug     = t.get("rugcheck_score", "N/A")
+
+        # Icônes selon le score
+        if score >= self.score_high:
+            header_icon = "🔴🔴 HIGH CONVICTION 🔴🔴"
+            score_bar   = "🟥" * (score // 10)
+        elif score >= self.score_alert:
+            header_icon = "🟡 GEM CANDIDATE 🟡"
+            score_bar   = "🟨" * (score // 10)
+        else:
+            header_icon = "📊 Analyse"
+            score_bar   = "⬜" * (score // 10)
+
+        pump_link = "https://pump.fun/%s" % addr
+        sol_link  = "https://solscan.io/token/%s" % addr
+        dex_link  = "https://dexscreener.com/solana/%s" % addr
+
+        # Breakdown formaté
+        bd_str = ""
+        if breakdown:
+            bd_str = (
+                "📊 **Breakdown:**\n"
+                "  🤝 Engagement: %d/30 | 🔥 Viral: %d/30\n"
+                "  🛡 Rug risk: %d/20 | 📈 Momentum: %d/20\n"
+            ) % (
+                breakdown.get("engagement_organique", 0),
+                breakdown.get("potentiel_viral", 0),
+                breakdown.get("risque_rug", 0),
+                breakdown.get("momentum", 0),
+            )
+
+        # Points forts/faibles
+        pf_str = ("\n".join("  ✅ " + p for p in points_f[:3])) if points_f else ""
+        pw_str = ("\n".join("  ⚠️ " + p for p in points_w[:2])) if points_w else ""
+
+        msg = (
+            "%s\n"
+            "━━━━━━━━━━━━━━━\n"
+            "🪙 **%s** — _%s_\n"
+            "🏷 Score Claude: **%d/100**  %s\n"
+            "\n"
+            "💰 MC: **$%s** | Vol 24h: **$%s**\n"
+            "👥 Holders: **%d** | 🎯 Snipers: **%s**\n"
+            "🧑‍💻 Dev: **%s%%** | Top10: **%s%%**\n"
+            "📈 Bonding: **%.1f%%** | ⏱ Âge: **%s**\n"
+            "🔍 RugCheck: **%s**\n"
+            "\n"
+            "%s"
+            "\n"
+            "💬 _%s_\n"
+            "\n"
+            "%s%s"
+            "\n"
+            "🤖 **Claude dit:** _%s_\n"
+            "\n"
+            "🎯 **%s** | TP: %s | SL: %s\n"
+            "\n"
+            "🔗 [Pump.fun](%s) | [DexScreener](%s) | [Solscan](%s)"
+        ) % (
+            header_icon,
+            symbol, name,
+            score, score_bar,
+            self._fmt_k(mc), self._fmt_k(vol),
+            holders, snipers,
+            dev_pct, top10,
+            bc_pct, age_str,
+            str(rug) if rug else "N/A",
+            bd_str,
+            desc or "Pas de description",
+            pf_str + "\n" if pf_str else "",
+            pw_str + "\n" if pw_str else "",
+            raison or verdict,
+            rec, " / ".join(tp) if isinstance(tp, list) else str(tp), sl,
+            pump_link, dex_link, sol_link,
+        )
+        return msg
+
+    # ══════════════════════════════════════════════════════════════
+    #   COMMANDES TRADING
+    # ══════════════════════════════════════════════════════════════
+
+    async def _cmd_trademode(self, args: str, ctx: SkillContext) -> str:
+        """Activer/désactiver le trading auto : /pumptrademode paper|live|off"""
+        mode = args.strip().lower()
+        if mode not in ("paper", "live", "off"):
+            mode_desc = {
+                "paper": "📄 Simulation — trades fictifs, P&L calculé en temps réel",
+                "live":  "💸 LIVE — trades réels sur Solana (nécessite PUMP_WALLET_KEY)",
+                "off":   "🚫 Désactivé — alertes uniquement, aucun trade automatique",
+            }
+            current = self.trade_mode
+            return (
+                "💹 **Mode trading actuel: %s**\n\n"
+                "Modes disponibles :\n"
+                "  `paper` — %s\n"
+                "  `live`  — %s\n"
+                "  `off`   — %s\n\n"
+                "Usage: `/pumptrademode paper|live|off`"
+                % (current, mode_desc["paper"], mode_desc["live"], mode_desc["off"])
+            )
+
+        if mode == "live" and not self.wallet_key:
+            return (
+                "❌ **Mode LIVE impossible sans wallet configuré**\n\n"
+                "Configure dans `.env` :\n"
+                "`PUMP_WALLET_KEY=ta_clé_privée_base58`\n"
+                "`PUMP_SOLANA_RPC=https://ton_rpc`\n\n"
+                "⚠️ Ne partage JAMAIS ta clé privée."
+            )
+
+        old_mode      = self.trade_mode
+        self.trade_mode = mode
+        self._save_state()
+
+        icons = {"paper": "📄", "live": "💸", "off": "🚫"}
+        warnings = {
+            "live":  "\n\n⚠️ **ATTENTION** : Les trades seront exécutés avec de vraies SOL !",
+            "paper": "",
+            "off":   "",
+        }
+        return (
+            "%s **Mode trading → %s**\n"
+            "(était: %s)%s\n\n"
+            "💰 Mise: $%.0f (base) / $%.0f (high conviction)\n"
+            "🎯 TP1: x%.1f | TP2: x%.1f | TP3: x%.1f | SL: -%.0f%%\n"
+            "📊 Max positions simultanées: %d\n\n"
+            "💡 `/pumpconfig` pour modifier les paramètres"
+            % (
+                icons.get(mode, ""), mode, old_mode, warnings.get(mode, ""),
+                self.buy_amount, self.buy_amount_high,
+                self.tp1, self.tp2, self.tp3, self.sl * 100,
+                self.max_open_trades,
+            )
+        )
+
+    async def _cmd_trades(self, args: str, ctx: SkillContext) -> str:
+        """Voir les positions ouvertes + historique clôturés + P&L"""
+        mode_icon = "📄" if self.trade_mode == "paper" else "💸"
+        lines = ["%s **Positions %s**\n━━━━━━━━━━━━━━━" % (mode_icon, self.trade_mode.upper())]
+
+        # ── Positions ouvertes ────────────────────────────────
+        if not self._positions:
+            lines.append("📭 Aucune position ouverte.")
+        else:
+            total_in  = 0.0
+            total_val = 0.0
+            for addr, pos in self._positions.items():
+                symbol      = pos.get("symbol", "?")
+                entry_price = pos.get("entry_price", 0)
+                amount_usd  = pos.get("amount_usd", 0)
+                shares      = pos.get("shares", 0)
+                opened_at   = pos.get("opened_at", "?")
+                score       = pos.get("score", 0)
+                conviction  = pos.get("conviction", "normal")
+                tp1_hit     = pos.get("tp1_hit", False)
+                tp2_hit     = pos.get("tp2_hit", False)
+                sl_price    = pos.get("sl_price", 0)
+
+                # Récupérer le prix actuel
+                cur_price = await self._get_token_price(addr)
+                if cur_price <= 0:
+                    cur_price = entry_price  # fallback
+
+                cur_val  = shares * cur_price if cur_price > 0 else amount_usd
+                pnl      = cur_val - amount_usd
+                pnl_pct  = (pnl / amount_usd * 100) if amount_usd > 0 else 0
+                mult     = cur_price / entry_price if entry_price > 0 else 1
+                pnl_icon = "🟢" if pnl >= 0 else "🔴"
+
+                tp_status = ""
+                if tp1_hit and tp2_hit:
+                    tp_status = " | TP1✅TP2✅"
+                elif tp1_hit:
+                    tp_status = " | TP1✅"
+
+                conv_icon = "🔴" if conviction == "high" else "🟡"
+                total_in  += amount_usd
+                total_val += cur_val
+
+                lines.append(
+                    "%s **%s** (%s) | Score: %d%s\n"
+                    "   Entrée: $%.4f → Actuel: $%.4f (x%.2f)\n"
+                    "   $%.2f → $%.2f | %s **%+.2f$** (%+.1f%%)%s\n"
+                    "   SL: $%.4f | %s"
+                    % (
+                        conv_icon, symbol, addr[:8], score, " 🔴HC" if conviction == "high" else "",
+                        entry_price, cur_price, mult,
+                        amount_usd, cur_val, pnl_icon, pnl, pnl_pct, tp_status,
+                        sl_price, opened_at,
+                    )
+                )
+
+            total_pnl = total_val - total_in
+            pnl_icon  = "🟢" if total_pnl >= 0 else "🔴"
+            lines.append(
+                "\n━━━━━━━━━━━━━━━\n"
+                "💰 Investi: $%.2f → Valeur: $%.2f\n"
+                "%s **P&L latent: $%+.2f**"
+                % (total_in, total_val, pnl_icon, total_pnl)
+            )
+
+        # ── Trades clôturés récents ───────────────────────────
+        if self._closed_trades:
+            lines.append("\n📋 **Trades clôturés (5 derniers) :**")
+            for t in self._closed_trades[-5:][::-1]:
+                pnl  = t.get("pnl", 0)
+                icon = "✅" if pnl >= 0 else "❌"
+                lines.append(
+                    "%s **%s** | %s | P&L: **$%+.2f** (x%.2f) | %s"
+                    % (icon, t.get("symbol","?"), t.get("reason","?"),
+                       pnl, t.get("multiplier", 1), t.get("closed_at","?"))
+                )
+
+        # ── P&L global ───────────────────────────────────────
+        pnl_icon = "🟢" if self._total_pnl >= 0 else "🔴"
+        lines.append(
+            "\n%s **P&L réalisé total: $%+.2f** | Aujourd'hui: $%+.2f"
+            % (pnl_icon, self._total_pnl, self._daily_pnl)
+        )
+
+        return "\n".join(lines)
+
+    async def _cmd_close(self, args: str, ctx: SkillContext) -> str:
+        """Fermer manuellement une position : /pumpclose <addr>"""
+        addr = args.strip()
+        if not addr:
+            if self._positions:
+                lines = ["📋 **Positions ouvertes (utilise /pumpclose <addr>) :**"]
+                for a, p in self._positions.items():
+                    lines.append("  `%s` — **%s**" % (a[:20], p.get("symbol","?")))
+                return "\n".join(lines)
+            return "📭 Aucune position ouverte."
+
+        # Chercher la position (partiel OK)
+        match = None
+        for a in self._positions:
+            if a.startswith(addr) or addr in a:
+                match = a
+                break
+
+        if not match:
+            return "❌ Position `%s` introuvable." % addr[:20]
+
+        pos        = self._positions[match]
+        cur_price  = await self._get_token_price(match)
+        entry_price = pos.get("entry_price", 0)
+        if cur_price <= 0:
+            cur_price = entry_price
+
+        pnl, mult = await self._close_position(match, cur_price, reason="Manuel")
+        pnl_icon  = "🟢" if pnl >= 0 else "🔴"
+        return (
+            "✅ **Position %s fermée manuellement**\n"
+            "   Prix sortie: $%.4f | Multiplicateur: x%.2f\n"
+            "%s P&L: **$%+.2f**"
+            % (pos.get("symbol","?"), cur_price, mult, pnl_icon, pnl)
+        )
+
+    async def _cmd_paper_reset(self, args: str, ctx: SkillContext) -> str:
+        """Remettre à zéro le paper trading"""
+        if args.strip().lower() != "confirm":
+            nb_pos    = len([p for p in self._positions.values() if p.get("paper", True)])
+            nb_closed = len([t for t in self._closed_trades if t.get("paper", True)])
+            pnl       = self._total_pnl
+            pnl_icon  = "🟢" if pnl >= 0 else "🔴"
+            return (
+                "⚠️ **Reset Paper Trading**\n"
+                "━━━━━━━━━━━━━━━\n"
+                "Ceci va effacer :\n"
+                "  • %d position(s) ouverte(s)\n"
+                "  • %d trade(s) clôturés\n"
+                "  • %s P&L réalisé: $%+.2f\n\n"
+                "Confirme : `/pumppaperreset confirm`"
+                % (nb_pos, nb_closed, pnl_icon, pnl)
+            )
+
+        # Reset
+        nb_pos    = len(self._positions)
+        nb_closed = len(self._closed_trades)
+        old_pnl   = self._total_pnl
+
+        self._positions    = {}
+        self._closed_trades = []
+        self._total_pnl    = 0.0
+        self._daily_pnl    = 0.0
+        self._save_state()
+
+        pnl_icon = "🟢" if old_pnl >= 0 else "🔴"
+        return (
+            "✅ **Paper Trading remis à zéro !**\n"
+            "━━━━━━━━━━━━━━━\n"
+            "Effacé :\n"
+            "  • %d position(s)\n"
+            "  • %d trade(s) clôturés\n"
+            "  • %s P&L: $%+.2f\n\n"
+            "Tout repart de zéro 🚀"
+            % (nb_pos, nb_closed, pnl_icon, old_pnl)
+        )
+
+    async def _cmd_config(self, args: str, ctx: SkillContext) -> str:
+        """Voir ou modifier la config trading"""
+        if not args:
+            return (
+                "⚙️ **Config Trading Pump.fun**\n"
+                "━━━━━━━━━━━━━━━\n"
+                "Mode: **%s**\n\n"
+                "💰 **Mises :**\n"
+                "  `buy_amount`      = $%.0f (base)\n"
+                "  `buy_amount_high` = $%.0f (high conviction)\n"
+                "  `buy_score_min`   = %d/100 (score min pour buy)\n"
+                "  `buy_score_high`  = %d/100 (score high conviction)\n\n"
+                "🎯 **Take Profits :**\n"
+                "  `tp1` = x%.1f → vendre 40%%\n"
+                "  `tp2` = x%.1f → vendre 35%%\n"
+                "  `tp3` = x%.1f → vendre 25%%\n\n"
+                "🛡 **Stop Loss :**\n"
+                "  `sl` = %.0f%% de perte\n\n"
+                "📊 **Limites :**\n"
+                "  `max_open_trades` = %d\n"
+                "  `max_daily_loss`  = $%.0f\n\n"
+                "Pour modifier : `/pumpconfig <clé> <valeur>`\n"
+                "Ex: `/pumpconfig buy_amount 25`"
+                % (
+                    self.trade_mode,
+                    self.buy_amount, self.buy_amount_high,
+                    self.buy_score_min, self.buy_score_high,
+                    self.tp1, self.tp2, self.tp3,
+                    self.sl * 100,
+                    self.max_open_trades, self.max_daily_loss,
+                )
+            )
+
+        parts = args.split()
+        if len(parts) != 2:
+            return "Usage: `/pumpconfig <clé> <valeur>`"
+
+        key, val_str = parts
+        config_map = {
+            "buy_amount":      ("buy_amount",      float),
+            "buy_amount_high": ("buy_amount_high",  float),
+            "buy_score_min":   ("buy_score_min",    int),
+            "buy_score_high":  ("buy_score_high",   int),
+            "tp1":             ("tp1",              float),
+            "tp2":             ("tp2",              float),
+            "tp3":             ("tp3",              float),
+            "sl":              ("sl",               float),
+            "max_open_trades": ("max_open_trades",  int),
+            "max_daily_loss":  ("max_daily_loss",   float),
+        }
+        if key not in config_map:
+            return "❌ Clé inconnue. `/pumpconfig` pour voir les clés disponibles."
+
+        attr, cast = config_map[key]
+        try:
+            val = cast(val_str)
+            # Normaliser sl (accepter 50 = 50% ou 0.50)
+            if key == "sl" and val > 1:
+                val = val / 100
+            setattr(self, attr, val)
+            self._save_state()
+            return "✅ **%s** → `%s`" % (key, val_str)
+        except ValueError:
+            return "❌ Valeur invalide : `%s`" % val_str
+
+    # ══════════════════════════════════════════════════════════════
+    #   MOTEUR DE TRADING AUTOMATIQUE
+    # ══════════════════════════════════════════════════════════════
+
+    async def _auto_trade(self, token_data: dict, score_result: dict):
+        """
+        Décide et exécute automatiquement un trade selon le score.
+
+        Logique :
+        - score >= buy_score_high → HIGH CONVICTION → mise x2
+        - score >= buy_score_min  → NORMAL → mise standard
+        - Vérifications : max_open_trades, max_daily_loss, déjà en position
+        """
+        score    = score_result.get("score", 0)
+        addr     = token_data.get("address", "")
+        symbol   = token_data.get("symbol", "?")
+
+        # Vérifier si déjà en position
+        if addr in self._positions:
+            logger.debug("Auto-trade ignoré: déjà en position sur %s", symbol)
+            return
+
+        # Vérifier score minimum
+        if score < self.buy_score_min:
+            logger.debug("Auto-trade ignoré: score %d < %d pour %s", score, self.buy_score_min, symbol)
+            return
+
+        # Vérifier limite positions simultanées
+        if len(self._positions) >= self.max_open_trades:
+            logger.warning("Auto-trade bloqué: max positions (%d) atteint", self.max_open_trades)
+            await self._notify(
+                "⚠️ **Auto-trade bloqué** : %d/%d positions déjà ouvertes\n"
+                "Token ignoré : **%s** (score %d/100)\n"
+                "Ferme une position avec `/pumpclose`"
+                % (len(self._positions), self.max_open_trades, symbol, score)
+            )
+            return
+
+        # Vérifier perte journalière max
+        self._check_daily_reset()
+        if self._daily_pnl <= -self.max_daily_loss:
+            logger.warning("Auto-trade bloqué: perte journalière max $%.2f atteinte", self.max_daily_loss)
+            await self._notify(
+                "🛑 **Trading pausé : perte journalière max atteinte**\n"
+                "Perte aujourd'hui: $%.2f / limite $%.2f\n"
+                "Trading reprendra demain automatiquement."
+                % (self._daily_pnl, self.max_daily_loss)
+            )
+            return
+
+        # Déterminer conviction et mise
+        conviction = "high" if score >= self.buy_score_high else "normal"
+        amount_usd = self.buy_amount_high if conviction == "high" else self.buy_amount
+
+        # Récupérer le prix d'entrée
+        entry_price = await self._get_token_price(addr)
+        if entry_price <= 0:
+            # Fallback sur MC / supply approximative
+            mc = token_data.get("market_cap", 0)
+            entry_price = mc / 1_000_000_000 if mc > 0 else 0  # Estimation
+        if entry_price <= 0:
+            logger.warning("Prix introuvable pour %s, trade annulé", symbol)
+            return
+
+        shares    = amount_usd / entry_price
+        sl_price  = entry_price * (1 - self.sl)
+
+        # ── PAPER MODE ────────────────────────────────────────
+        if self.trade_mode == "paper":
+            self._positions[addr] = {
+                "symbol":       symbol,
+                "name":         token_data.get("name", "?"),
+                "entry_price":  entry_price,
+                "amount_usd":   amount_usd,
+                "shares":       shares,
+                "sl_price":     sl_price,
+                "opened_at":    datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "timestamp":    int(time.time()),
+                "score":        score,
+                "conviction":   conviction,
+                "tp1_hit":      False,
+                "tp2_hit":      False,
+                "tp3_hit":      False,
+                "paper":        True,
+                "tp1_price":    entry_price * self.tp1,
+                "tp2_price":    entry_price * self.tp2,
+                "tp3_price":    entry_price * self.tp3,
+                "remaining_shares": shares,
+            }
+            self._save_state()
+            logger.info(
+                "PAPER BUY %s: $%.2f @ $%.6f | SL: $%.6f | Score: %d/100",
+                symbol, amount_usd, entry_price, sl_price, score
+            )
+            conv_badge = "🔴 HIGH CONVICTION" if conviction == "high" else "🟡 Normal"
+            await self._notify(
+                "📄 **AUTO-TRADE PAPER — BUY**\n"
+                "━━━━━━━━━━━━━━━\n"
+                "🪙 **%s** | Score: **%d/100** | %s\n"
+                "💰 Mise: **$%.2f** @ `$%.6f`\n"
+                "📈 TP1: $%.6f (x%.1f) | TP2: $%.6f (x%.1f) | TP3: $%.6f (x%.1f)\n"
+                "🛡 SL: $%.6f (-%.0f%%)\n"
+                "🔗 https://pump.fun/%s"
+                % (
+                    symbol, score, conv_badge,
+                    amount_usd, entry_price,
+                    entry_price * self.tp1, self.tp1,
+                    entry_price * self.tp2, self.tp2,
+                    entry_price * self.tp3, self.tp3,
+                    sl_price, self.sl * 100,
+                    addr,
+                )
+            )
+
+        # ── LIVE MODE ─────────────────────────────────────────
+        elif self.trade_mode == "live":
+            if not self.wallet_key:
+                await self._notify("❌ LIVE trade impossible : PUMP_WALLET_KEY manquant")
+                return
+
+            tx_hash = await self._execute_live_buy(addr, amount_usd, entry_price)
+            if not tx_hash:
+                await self._notify(
+                    "❌ **AUTO-TRADE LIVE ÉCHOUÉ**\n"
+                    "Token: **%s** | Tentative: $%.2f\n"
+                    "Vérifie les logs pour détails." % (symbol, amount_usd)
+                )
+                return
+
+            # Enregistrer la position
+            self._positions[addr] = {
+                "symbol":       symbol,
+                "name":         token_data.get("name", "?"),
+                "entry_price":  entry_price,
+                "amount_usd":   amount_usd,
+                "shares":       shares,
+                "sl_price":     sl_price,
+                "opened_at":    datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "timestamp":    int(time.time()),
+                "score":        score,
+                "conviction":   conviction,
+                "tp1_hit":      False,
+                "tp2_hit":      False,
+                "tp3_hit":      False,
+                "paper":        False,
+                "tx_hash_buy":  tx_hash,
+                "tp1_price":    entry_price * self.tp1,
+                "tp2_price":    entry_price * self.tp2,
+                "tp3_price":    entry_price * self.tp3,
+                "remaining_shares": shares,
+            }
+            self._save_state()
+            conv_badge = "🔴 HIGH CONVICTION" if conviction == "high" else "🟡 Normal"
+            await self._notify(
+                "💸 **AUTO-TRADE LIVE — BUY EXÉCUTÉ**\n"
+                "━━━━━━━━━━━━━━━\n"
+                "🪙 **%s** | Score: **%d/100** | %s\n"
+                "💰 Mise: **$%.2f** @ `$%.6f`\n"
+                "📈 TP1: x%.1f | TP2: x%.1f | TP3: x%.1f | SL: -%.0f%%\n"
+                "🔗 TX: `%s`"
+                % (
+                    symbol, score, conv_badge,
+                    amount_usd, entry_price,
+                    self.tp1, self.tp2, self.tp3, self.sl * 100,
+                    tx_hash[:20] + "...",
+                )
+            )
+
+    async def _monitor_positions(self):
+        """
+        Vérifie le prix actuel de chaque position ouverte.
+        Déclenche TP partiels ou SL selon les niveaux atteints.
+        Appelé à chaque cycle depuis _main_loop.
+        """
+        if not self._positions:
+            return
+
+        for addr in list(self._positions.keys()):
+            pos = self._positions.get(addr)
+            if not pos:
+                continue
+
+            cur_price = await self._get_token_price(addr)
+            if cur_price <= 0:
+                continue
+
+            entry_price      = pos.get("entry_price", 0)
+            sl_price         = pos.get("sl_price", 0)
+            symbol           = pos.get("symbol", "?")
+            remaining_shares = pos.get("remaining_shares", pos.get("shares", 0))
+
+            if entry_price <= 0:
+                continue
+
+            mult = cur_price / entry_price
+
+            # ── STOP LOSS ─────────────────────────────────────
+            if cur_price <= sl_price and sl_price > 0:
+                pnl, _ = await self._close_position(addr, cur_price, reason="Stop Loss")
+                await self._notify(
+                    "🛑 **STOP LOSS déclenché**\n"
+                    "🪙 **%s** | Prix: $%.6f\n"
+                    "📉 x%.2f | P&L: **$%+.2f**\n"
+                    "SL atteint à -%.0f%%"
+                    % (symbol, cur_price, mult, pnl, self.sl * 100)
+                )
+                continue
+
+            # ── TAKE PROFIT 1 (x2 → vendre 40%) ──────────────
+            if not pos.get("tp1_hit") and cur_price >= pos.get("tp1_price", float("inf")):
+                shares_sell = remaining_shares * 0.40
+                pnl_partial = shares_sell * (cur_price - entry_price)
+                self._positions[addr]["tp1_hit"]        = True
+                self._positions[addr]["remaining_shares"] = remaining_shares - shares_sell
+                # Remonter le SL au breakeven
+                self._positions[addr]["sl_price"] = entry_price * 1.01
+                self._record_partial_pnl(pnl_partial)
+                await self._notify(
+                    "✅ **TP1 atteint !** 🎉\n"
+                    "🪙 **%s** x%.1f @ $%.6f\n"
+                    "💰 Vendu 40%% → P&L partiel: **$%+.2f**\n"
+                    "📊 SL remonté au breakeven | 60%% encore en jeu"
+                    % (symbol, mult, cur_price, pnl_partial)
+                )
+                if self.trade_mode == "live":
+                    await self._execute_live_sell(addr, shares_sell, cur_price)
+
+            # ── TAKE PROFIT 2 (x3 → vendre 35%) ──────────────
+            elif pos.get("tp1_hit") and not pos.get("tp2_hit") and cur_price >= pos.get("tp2_price", float("inf")):
+                remaining_now = self._positions[addr].get("remaining_shares", remaining_shares)
+                shares_sell   = remaining_now * 0.583  # 35% du total original
+                pnl_partial   = shares_sell * (cur_price - entry_price)
+                self._positions[addr]["tp2_hit"]        = True
+                self._positions[addr]["remaining_shares"] = remaining_now - shares_sell
+                # Remonter le SL à TP1
+                self._positions[addr]["sl_price"] = pos.get("tp1_price", entry_price * self.tp1) * 0.95
+                self._record_partial_pnl(pnl_partial)
+                await self._notify(
+                    "✅✅ **TP2 atteint !** 🚀\n"
+                    "🪙 **%s** x%.1f @ $%.6f\n"
+                    "💰 Vendu 35%% de plus → P&L partiel: **$%+.2f**\n"
+                    "📊 SL remonté à TP1 | 25%% en mode moon"
+                    % (symbol, mult, cur_price, pnl_partial)
+                )
+                if self.trade_mode == "live":
+                    await self._execute_live_sell(addr, shares_sell, cur_price)
+
+            # ── TAKE PROFIT 3 (x5 → vendre tout) ─────────────
+            elif pos.get("tp2_hit") and not pos.get("tp3_hit") and cur_price >= pos.get("tp3_price", float("inf")):
+                pnl, mult_final = await self._close_position(addr, cur_price, reason="TP3 x%.1f" % self.tp3)
+                await self._notify(
+                    "🏆🏆 **TP3 — MOON ATTEINT !**\n"
+                    "🪙 **%s** x%.1f @ $%.6f\n"
+                    "💰 Position fermée | P&L total: **$%+.2f**\n"
+                    "🎉 LFG !"
+                    % (symbol, mult_final, cur_price, pnl)
+                )
+
+    async def _close_position(self, addr: str, cur_price: float, reason: str = "") -> tuple:
+        """
+        Ferme une position complètement.
+        Retourne (pnl, multiplicateur).
+        """
+        pos = self._positions.get(addr)
+        if not pos:
+            return 0.0, 1.0
+
+        entry_price = pos.get("entry_price", cur_price)
+        amount_usd  = pos.get("amount_usd", 0)
+        shares      = pos.get("remaining_shares", pos.get("shares", 0))
+        symbol      = pos.get("symbol", "?")
+        opened_at   = pos.get("opened_at", "?")
+        held_h      = (time.time() - pos.get("timestamp", time.time())) / 3600
+        paper       = pos.get("paper", True)
+
+        payout = shares * cur_price
+        pnl    = payout - amount_usd
+        mult   = cur_price / entry_price if entry_price > 0 else 1.0
+
+        # Enregistrer
+        self._closed_trades.append({
+            "symbol":     symbol,
+            "address":    addr,
+            "entry_price": entry_price,
+            "exit_price": cur_price,
+            "amount_usd": amount_usd,
+            "payout":     payout,
+            "pnl":        pnl,
+            "multiplier": mult,
+            "reason":     reason,
+            "opened_at":  opened_at,
+            "closed_at":  datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "held_hours": round(held_h, 1),
+            "paper":      paper,
+        })
+
+        self._total_pnl  += pnl
+        self._daily_pnl  += pnl
+
+        del self._positions[addr]
+
+        if self.trade_mode == "live" and not paper:
+            await self._execute_live_sell(addr, shares, cur_price)
+
+        self._save_state()
+        logger.info(
+            "CLOSE %s %s @ $%.6f | x%.2f | P&L $%+.2f | %s",
+            "PAPER" if paper else "LIVE", symbol, cur_price, mult, pnl, reason
+        )
+        return pnl, mult
+
+    def _record_partial_pnl(self, pnl: float):
+        """Enregistre un P&L de TP partiel"""
+        self._total_pnl += pnl
+        self._daily_pnl += pnl
+        self._save_state()
+
+    def _check_daily_reset(self):
+        """Remet à zéro le P&L journalier à minuit"""
+        today = datetime.now().strftime("%Y-%m-%d")
+        if self._daily_pnl_date != today:
+            self._daily_pnl_date = today
+            self._daily_pnl      = 0.0
+
+    # ══════════════════════════════════════════════════════════════
+    #   PRIX EN TEMPS RÉEL
+    # ══════════════════════════════════════════════════════════════
+
+    async def _get_token_price(self, addr: str) -> float:
+        """
+        Récupère le prix actuel d'un token Solana.
+        Sources : DexScreener → Birdeye → Pump.fun.
+        """
+        if not addr:
+            return 0.0
+
+        headers = {"User-Agent": "Mozilla/5.0"}
+
+        # ── DexScreener token-pairs/v1 (endpoint correct) ───
+        try:
+            async with aiohttp.ClientSession() as session:
+                # Essayer d'abord le nouveau endpoint v1
+                for url in [
+                    "%s/%s" % (DEXSCREENER_V1, addr),
+                    "%s/%s" % (DEXSCREENER_PAIRS, addr),
+                ]:
+                    async with session.get(
+                        url,
+                        headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=6),
+                    ) as r:
+                        if r.status == 200:
+                            data = await r.json(content_type=None)
+                            # token-pairs/v1 retourne une liste directement
+                            pairs = data if isinstance(data, list) else (data.get("pairs") or []) if isinstance(data, dict) else []
+                            if pairs:
+                                # Prendre la paire avec le plus de liquidité
+                                best = max(pairs, key=lambda x: float((x.get("liquidity") or {}).get("usd", 0) or 0), default=pairs[0])
+                                p = float(best.get("priceUsd", 0) or 0)
+                                if p > 0:
+                                    return p
+                        await asyncio.sleep(0.1)
+        except Exception as e:
+            logger.debug("get_price DexScreener %s: %s", addr[:8], e)
+
+        # ── Birdeye (si clé dispo) ────────────────────────────
+        birdeye_key = os.getenv("BIRDEYE_API_KEY", "")
+        if birdeye_key:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        "%s/public/price" % BIRDEYE_API,
+                        params={"address": addr},
+                        headers={**headers, "X-API-KEY": birdeye_key, "x-chain": "solana"},
+                        timeout=aiohttp.ClientTimeout(total=6),
+                    ) as r:
+                        if r.status == 200:
+                            data = await r.json(content_type=None)
+                            p    = float(data.get("data", {}).get("value", 0) or 0)
+                            if p > 0:
+                                return p
+            except Exception as e:
+                logger.debug("get_price Birdeye %s: %s", addr[:8], e)
+
+        # ── Pump.fun (MC / supply) ────────────────────────────
+        try:
+            pf = await self._fetch_pumpfun_coin(addr)
+            if pf:
+                mc = float(pf.get("usd_market_cap", 0) or 0)
+                # Pump.fun tokens ont une supply de 1B
+                if mc > 0:
+                    return mc / 1_000_000_000
+        except Exception as e:
+            logger.debug("get_price PumpFun %s: %s", addr[:8], e)
+
+        return 0.0
+
+    # ══════════════════════════════════════════════════════════════
+    #   EXÉCUTION LIVE (SOLANA)
+    # ══════════════════════════════════════════════════════════════
+
+    async def _execute_live_buy(self, addr: str, amount_usd: float, price: float) -> Optional[str]:
+        """
+        Exécute un achat réel sur Pump.fun via Jupiter Aggregator ou Pump.fun API.
+        Retourne le tx_hash ou None si échec.
+
+        ⚠️  IMPORTANT : Cette fonction requiert PUMP_WALLET_KEY configuré.
+        Elle construit et signe une transaction Solana.
+        """
+        if not self.wallet_key:
+            logger.error("LIVE BUY impossible: PUMP_WALLET_KEY non configuré")
+            return None
+
+        logger.info(
+            "LIVE BUY %s: $%.2f @ $%.6f",
+            addr[:16], amount_usd, price
+        )
+
+        # ── Tentative via Jupiter API (swap USDC → token) ────
+        try:
+            # Convertir USD en lamports USDC (6 decimals)
+            USDC_MINT    = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+            usdc_amount  = int(amount_usd * 1_000_000)  # 6 decimals
+
+            async with aiohttp.ClientSession() as session:
+                # 1. Obtenir le quote Jupiter
+                async with session.get(
+                    "https://quote-api.jup.ag/v6/quote",
+                    params={
+                        "inputMint":  USDC_MINT,
+                        "outputMint": addr,
+                        "amount":     usdc_amount,
+                        "slippageBps": 500,  # 5% slippage max
+                    },
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as r:
+                    if r.status != 200:
+                        logger.warning("Jupiter quote failed: %d", r.status)
+                        return None
+                    quote = await r.json()
+
+                # 2. Construire la transaction
+                async with session.post(
+                    "https://quote-api.jup.ag/v6/swap",
+                    json={
+                        "quoteResponse":        quote,
+                        "userPublicKey":        self._get_public_key(),
+                        "wrapAndUnwrapSol":     True,
+                        "computeUnitPriceMicroLamports": 100000,
+                    },
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as r:
+                    if r.status != 200:
+                        logger.warning("Jupiter swap build failed: %d", r.status)
+                        return None
+                    swap_data   = await r.json()
+                    swap_tx_b64 = swap_data.get("swapTransaction", "")
+
+                # 3. Signer et envoyer via RPC Solana
+                tx_hash = await self._sign_and_send_transaction(swap_tx_b64)
+                if tx_hash:
+                    logger.info("LIVE BUY OK: tx=%s", tx_hash[:20])
+                    return tx_hash
+
+        except Exception as e:
+            logger.error("Live buy error %s: %s", addr[:16], e)
+
+        return None
+
+    async def _execute_live_sell(self, addr: str, shares: float, price: float) -> Optional[str]:
+        """
+        Exécute une vente réelle sur Jupiter.
+        Retourne le tx_hash ou None.
+        """
+        if not self.wallet_key:
+            logger.error("LIVE SELL impossible: PUMP_WALLET_KEY non configuré")
+            return None
+
+        logger.info("LIVE SELL %s: %.4f shares @ $%.6f", addr[:16], shares, price)
+
+        try:
+            USDC_MINT   = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+            # Estimation du montant en plus petite unité (assume 6 decimals)
+            token_amount = int(shares * 1_000_000)
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    "https://quote-api.jup.ag/v6/quote",
+                    params={
+                        "inputMint":  addr,
+                        "outputMint": USDC_MINT,
+                        "amount":     token_amount,
+                        "slippageBps": 500,
+                    },
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as r:
+                    if r.status != 200:
+                        return None
+                    quote = await r.json()
+
+                async with session.post(
+                    "https://quote-api.jup.ag/v6/swap",
+                    json={
+                        "quoteResponse":  quote,
+                        "userPublicKey":  self._get_public_key(),
+                        "wrapAndUnwrapSol": True,
+                    },
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as r:
+                    if r.status != 200:
+                        return None
+                    swap_data   = await r.json()
+                    swap_tx_b64 = swap_data.get("swapTransaction", "")
+
+                tx_hash = await self._sign_and_send_transaction(swap_tx_b64)
+                if tx_hash:
+                    logger.info("LIVE SELL OK: tx=%s", tx_hash[:20])
+                    return tx_hash
+
+        except Exception as e:
+            logger.error("Live sell error %s: %s", addr[:16], e)
+
+        return None
+
+    def _get_public_key(self) -> str:
+        """Dérive la clé publique depuis la clé privée"""
+        try:
+            import base58
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+            key_bytes = base58.b58decode(self.wallet_key)
+            if len(key_bytes) == 64:
+                key_bytes = key_bytes[:32]
+            priv = Ed25519PrivateKey.from_private_bytes(key_bytes)
+            pub  = priv.public_key().public_bytes_raw()
+            return base58.b58encode(pub).decode()
+        except ImportError:
+            logger.error("base58 ou cryptography non installé. pip install base58 cryptography")
+            return ""
+        except Exception as e:
+            logger.error("get_public_key: %s", e)
+            return ""
+
+    async def _sign_and_send_transaction(self, tx_b64: str) -> Optional[str]:
+        """
+        Signe une transaction versioning Solana et l'envoie au RPC.
+        Retourne le tx_hash ou None.
+        """
+        if not tx_b64 or not self.wallet_key:
+            return None
+        try:
+            import base64, base58
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+            # Décoder la transaction
+            tx_bytes  = base64.b64decode(tx_b64)
+            key_bytes = base58.b58decode(self.wallet_key)
+            if len(key_bytes) == 64:
+                key_bytes = key_bytes[:32]
+            priv_key = Ed25519PrivateKey.from_private_bytes(key_bytes)
+
+            # Signer le message (bytes 65+ pour versioned tx)
+            # Format simplifié — en production utiliser solana-py pour la gestion complète
+            signature  = priv_key.sign(tx_bytes)
+            signed_tx  = base64.b64encode(signature + tx_bytes).decode()
+
+            # Envoyer au RPC Solana
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    self.solana_rpc,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id":      1,
+                        "method":  "sendTransaction",
+                        "params":  [
+                            signed_tx,
+                            {"encoding": "base64", "skipPreflight": False,
+                             "preflightCommitment": "confirmed"},
+                        ],
+                    },
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as r:
+                    data = await r.json()
+                    if "result" in data:
+                        return data["result"]
+                    logger.error("sendTransaction error: %s", data.get("error", data))
+                    return None
+
+        except ImportError:
+            logger.error(
+                "Dépendances manquantes pour live trading. "
+                "Installe : pip install base58 cryptography"
+            )
+            return None
+        except Exception as e:
+            logger.error("sign_and_send_transaction: %s", e)
+            return None
+
+    async def _cmd_scanlog(self, args: str, ctx: SkillContext) -> str:
+        """Affiche le log détaillé des scans : /pumpscanlog [N=10]"""
+        try:
+            n = int(args.strip()) if args.strip() else 10
+            n = max(1, min(n, 50))
+        except ValueError:
+            n = 10
+
+        if not self._scan_log:
+            return "📋 Aucun scan enregistré.\n`/pumpstart` pour lancer le scanner."
+
+        lines = ["📋 **Scan Log — %d derniers scans**\n━━━━━━━━━━━━━━━" % n]
+
+        for scan in self._scan_log[-n:][::-1]:
+            num        = scan.get("num", 0)
+            ts         = scan.get("ts", "?")
+            elapsed    = scan.get("elapsed_s", 0)
+            buf        = scan.get("buf_tokens", 0)
+            candidates = scan.get("candidates", 0)
+            scored     = scan.get("scored", [])
+            ws         = "🟢" if scan.get("ws") else "🔴"
+            alerted    = sum(1 for s in scored if s.get("alerted"))
+
+            header = (
+                "\n**Scan #%d** — %s %s\n"
+                "⏱ %.1fs | 📥 %d buffered → %d candidats → %d scorés → %d alertes"
+            ) % (num, ts, ws, elapsed, buf, candidates, len(scored), alerted)
+            lines.append(header)
+
+            if scored:
+                for s in sorted(scored, key=lambda x: x.get("score", 0), reverse=True):
+                    score   = s.get("score", 0)
+                    symbol  = s.get("symbol", "?")
+                    mc      = self._fmt_k(s.get("mc", 0))
+                    holders = s.get("holders", 0)
+                    rec     = s.get("rec", "")
+                    verdict = s.get("verdict", "")[:50]
+                    addr    = s.get("address", "")
+
+                    if score >= self.score_high:
+                        icon = "🔴"
+                    elif score >= self.score_alert:
+                        icon = "🟡"
+                    else:
+                        icon = "⚪"
+
+                    alerted_tag = " 🔔" if s.get("alerted") else ""
+                    row = "  %s **%s** $%s | %d h | **%d/100** %s%s\n     _%s_ %s" % (
+                        icon, symbol, mc, holders, score, rec, alerted_tag,
+                        verdict, addr[:20]
+                    )
+                    lines.append(row)
+            else:
+                lines.append("  _(aucun candidat)_")
+
+        total_candidates = sum(s.get("candidates", 0) for s in self._scan_log)
+        total_alerted    = sum(
+            sum(1 for sc in s.get("scored", []) if sc.get("alerted"))
+            for s in self._scan_log
+        )
+        lines.append(
+            "\n━━━━━━━━━━━━━━━\n📊 **Stats** — %d scans | %d candidats | %d alertes"
+            % (len(self._scan_log), total_candidates, total_alerted)
+        )
+        return "\n".join(lines)
+
+
+    # ══════════════════════════════════════════════════════════════
+    #   PERSISTENCE
+    # ══════════════════════════════════════════════════════════════
+
+    def _save_state(self):
+        try:
+            state = {
+                "scan_interval":   self.scan_interval,
+                "mc_min":          self.mc_min,
+                "mc_max":          self.mc_max,
+                "volume_min":      self.volume_min,
+                "holders_min":     self.holders_min,
+                "snipers_max":     self.snipers_max,
+                "dev_hold_max":    self.dev_hold_max,
+                "top10_max":       self.top10_max,
+                "age_max_hours":   self.age_max_hours,
+                "score_alert":     self.score_alert,
+                "score_high":      self.score_high,
+                "blacklist":       list(self._blacklist),
+                "alerts_log":      self._alerts_log[-100:],
+                "scan_count":      self._scan_count,
+                # Trading
+                "trade_mode":      self.trade_mode,
+                "buy_amount":      self.buy_amount,
+                "buy_amount_high": self.buy_amount_high,
+                "buy_score_min":   self.buy_score_min,
+                "buy_score_high":  self.buy_score_high,
+                "tp1":             self.tp1,
+                "tp2":             self.tp2,
+                "tp3":             self.tp3,
+                "sl":              self.sl,
+                "max_open_trades": self.max_open_trades,
+                "max_daily_loss":  self.max_daily_loss,
+                "positions":       self._positions,
+                "closed_trades":   self._closed_trades[-200:],
+                "total_pnl":       self._total_pnl,
+                "daily_pnl":       self._daily_pnl,
+                "daily_pnl_date":  self._daily_pnl_date,
+                "scan_log":        [
+                    {k: v for k, v in s.items() if k != "scored"}
+                    for s in self._scan_log[-50:]
+                ],
+            }
+            with open("/tmp/jarvis_pumpfun_state.json", "w") as f:
+                json.dump(state, f)
+        except Exception as e:
+            logger.error("save_state: %s", e)
+
+    def _load_state(self):
+        try:
+            with open("/tmp/jarvis_pumpfun_state.json") as f:
+                state = json.load(f)
+            self.scan_interval   = state.get("scan_interval",  self.scan_interval)
+            self.mc_min          = state.get("mc_min",         self.mc_min)
+            self.mc_max          = state.get("mc_max",         self.mc_max)
+            self.volume_min      = state.get("volume_min",     self.volume_min)
+            self.holders_min     = state.get("holders_min",    self.holders_min)
+            self.snipers_max     = state.get("snipers_max",    self.snipers_max)
+            self.dev_hold_max    = state.get("dev_hold_max",   self.dev_hold_max)
+            self.top10_max       = state.get("top10_max",      self.top10_max)
+            self.age_max_hours   = state.get("age_max_hours",  self.age_max_hours)
+            self.score_alert     = state.get("score_alert",    self.score_alert)
+            self.score_high      = state.get("score_high",     self.score_high)
+            self._blacklist      = set(state.get("blacklist",  []))
+            self._alerts_log     = state.get("alerts_log",     [])
+            self._scan_count     = state.get("scan_count",     0)
+            # Trading
+            self.trade_mode      = state.get("trade_mode",     self.trade_mode)
+            self.buy_amount      = state.get("buy_amount",     self.buy_amount)
+            self.buy_amount_high = state.get("buy_amount_high", self.buy_amount_high)
+            self.buy_score_min   = state.get("buy_score_min",  self.buy_score_min)
+            self.buy_score_high  = state.get("buy_score_high", self.buy_score_high)
+            self.tp1             = state.get("tp1",            self.tp1)
+            self.tp2             = state.get("tp2",            self.tp2)
+            self.tp3             = state.get("tp3",            self.tp3)
+            self.sl              = state.get("sl",             self.sl)
+            self.max_open_trades = state.get("max_open_trades", self.max_open_trades)
+            self.max_daily_loss  = state.get("max_daily_loss", self.max_daily_loss)
+            self._positions      = state.get("positions",      {})
+            self._closed_trades  = state.get("closed_trades",  [])
+            self._total_pnl      = state.get("total_pnl",      0.0)
+            self._daily_pnl      = state.get("daily_pnl",      0.0)
+            self._daily_pnl_date = state.get("daily_pnl_date", "")
+            # Note: scored details non persistés (trop lourd), juste les méta
+            saved_scan_log = state.get("scan_log", [])
+            self._scan_log = [{**s, "scored": []} for s in saved_scan_log]
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.error("load_state: %s", e)
+
+    # ══════════════════════════════════════════════════════════════
+    #   HELPERS
+    # ══════════════════════════════════════════════════════════════
+
+    async def _notify(self, text: str):
+        """Envoie une notification proactive via le contexte JARVIS"""
+        if self._send_callback and self._context:
+            try:
+                await self._send_callback(self._context, text)
+            except Exception as e:
+                logger.error("notify: %s", e)
+
+    @staticmethod
+    def _fmt_k(n) -> str:
+        """Formater un nombre : 25000 → '25K', 1500000 → '1.5M'"""
+        try:
+            n = float(n)
+        except (TypeError, ValueError):
+            return "?"
+        if n >= 1_000_000:
+            return "%.1fM" % (n / 1_000_000)
+        if n >= 1_000:
+            return "%.0fK" % (n / 1_000)
+        return "%.0f" % n
+
+    @staticmethod
+    def _fmt_duration(seconds: int) -> str:
+        """Formater une durée : 3723 → '1h2m'"""
+        if seconds < 60:
+            return "%ds" % seconds
+        if seconds < 3600:
+            return "%dm%ds" % (seconds // 60, seconds % 60)
+        h = seconds // 3600
+        m = (seconds % 3600) // 60
+        return "%dh%dm" % (h, m) if m else "%dh" % h
+
+
+# ══════════════════════════════════════════════════════════════════
+#   POINT D'ENTRÉE AUTONOME (test sans JARVIS)
+# ══════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    """
+    Test autonome : lance un scan unique et affiche les résultats.
+    Usage : python skill_pumpfun.py
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
+    async def _test():
+        skill = PumpFunSkill()
+        print("\n=== PUMP.FUN SCANNER — TEST ===\n")
+        print("Filtres actifs :")
+        print("  MC: $%s–$%s" % (skill._fmt_k(skill.mc_min), skill._fmt_k(skill.mc_max)))
+        print("  Volume: >$%s" % skill._fmt_k(skill.volume_min))
+        print("  Holders: >%d" % skill.holders_min)
+        print("  Snipers: <%d | Dev: <%d%% | Top10: <%d%%" % (
+            skill.snipers_max, skill.dev_hold_max, skill.top10_max))
+        print()
+
+        print("Récupération des tokens...")
+        raw   = await skill._fetch_pump_tokens()
+        print("%d tokens bruts récupérés" % len(raw))
+
+        candidates = []
+        for token in raw[:20]:  # Limiter à 20 pour le test
+            enriched = await skill._enrich_token(token)
+            if not enriched:
+                continue
+            ok, reason = skill._apply_filters(enriched)
+            if ok:
+                candidates.append(enriched)
+                print("✅ %s (%s) | MC:$%s Vol:$%s H:%d" % (
+                    enriched.get("symbol","?"),
+                    enriched.get("address","")[:8],
+                    skill._fmt_k(enriched.get("market_cap",0)),
+                    skill._fmt_k(enriched.get("volume_24h",0)),
+                    enriched.get("holders",0),
+                ))
+            else:
+                print("❌ %s — %s" % (token.get("symbol","?"), reason))
+
+        print("\n%d candidats passent les filtres" % len(candidates))
+
+        if candidates and skill.anthropic_key:
+            print("\nScoring du premier candidat via Claude...")
+            result = await skill._score_with_claude(candidates[0])
+            print("Score: %d/100" % result.get("score", 0))
+            print("Verdict: %s" % result.get("verdict", ""))
+            print("Recommendation: %s" % result.get("recommendation", ""))
+        elif not skill.anthropic_key:
+            print("\n⚠️  ANTHROPIC_API_KEY non configurée → scoring désactivé")
+
+    asyncio.run(_test())

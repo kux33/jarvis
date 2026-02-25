@@ -74,6 +74,7 @@ logger = logging.getLogger("skill_pumpfun")
 PUMPPORTAL_WS     = "wss://pumpportal.fun/api/data"           # WebSocket officiel temps réel
 PUMPPORTAL_TRADE  = "https://pumpportal.fun/api/trade-local"
 PUMPFUN_API       = "https://frontend-api-v3.pump.fun"        # enrichissement par adresse
+MORALIS_SOL_GW    = "https://solana-gateway.moralis.io"        # volume + pairs fiables
 DEXSCREENER_V1    = "https://api.dexscreener.com/token-pairs/v1/solana"
 DEXSCREENER_PAIRS = "https://api.dexscreener.com/latest/dex/tokens"
 RUGCHECK_API      = "https://api.rugcheck.xyz/v1"
@@ -133,11 +134,13 @@ class PumpFunSkill(BaseSkill):
         self.age_max_hours    = float(os.getenv("PUMP_AGE_MAX_HOURS", "2"))
         self.score_alert      = int(os.getenv("PUMP_SCORE_ALERT",     "70"))
         self.score_high       = int(os.getenv("PUMP_SCORE_HIGH",      "85"))
+        self.notify_mc_zone   = os.getenv("PUMP_NOTIFY_MC_ZONE", "true").lower() == "true"
         self.max_alerts_hour  = int(os.getenv("PUMP_MAX_ALERTS_PER_HOUR", "10"))
         self.rugcheck_enabled = os.getenv("PUMP_RUGCHECK_ENABLED", "true").lower() == "true"
 
         # Clés API
         self.anthropic_key    = os.getenv("ANTHROPIC_API_KEY", "")
+        self.moralis_key      = os.getenv("MORALIS_API_KEY", "")
         self.solana_rpc       = os.getenv("PUMP_SOLANA_RPC", "https://api.mainnet-beta.solana.com")
         self.wallet_key       = os.getenv("PUMP_WALLET_KEY", "")  # NE JAMAIS LOGGER
 
@@ -189,15 +192,22 @@ class PumpFunSkill(BaseSkill):
         self._ws_sol_price_ts: float = 0.0
 
         # Queue événementielle : WS → workers (remplace le buffer passif)
-        self._token_queue: asyncio.Queue = asyncio.Queue(maxsize=500)
+        self._token_queue: asyncio.Queue = asyncio.Queue(maxsize=2000)
         # Pool de workers concurrents pour enrichissement + scoring
         self._worker_tasks: list = []
-        self._n_workers: int     = int(os.getenv("PUMP_WORKERS", "3"))
+        self._n_workers: int     = int(os.getenv("PUMP_WORKERS", "8"))
         # TTL : ignorer un token si pas traité dans ce délai
         self._ws_buffer_ttl: int = int(os.getenv("PUMP_TOKEN_TTL", "900"))  # 15min défaut
         # Délai de polling MC pour attendre la zone cible (en secondes)
         self._mc_poll_interval: float = float(os.getenv("PUMP_MC_POLL", "15"))
-        self._mc_poll_max: int        = int(os.getenv("PUMP_MC_POLL_MAX", "8"))  # max 8 polls = 2min
+        self._mc_poll_max: int        = int(os.getenv("PUMP_MC_POLL_MAX", "12"))  # 12 polls × 15s = ~3min
+        # Abandon précoce : si MC < X% de mc_min après N polls, on abandonne
+        self._mc_poll_abandon_pct: float = float(os.getenv("PUMP_MC_ABANDON_PCT", "0.4"))  # <40% de mc_min
+        self._mc_poll_abandon_after: int = int(os.getenv("PUMP_MC_ABANDON_AFTER", "3"))  # après 3 polls
+
+        # Tracker de volume par token (addr → volume USD cumulé depuis le WS)
+        # Alimenté par chaque transaction vue sur le WS avant/pendant le polling
+        self._vol_tracker: dict = {}   # addr → float (USD)
 
         # Stats événementielles
         self._stats_received:  int = 0   # tokens reçus du WS
@@ -257,7 +267,7 @@ class PumpFunSkill(BaseSkill):
                 "Le scan peut quand même tourner (score désactivé)."
             )
         self._running        = True
-        self._token_queue    = asyncio.Queue(maxsize=500)
+        self._token_queue    = asyncio.Queue(maxsize=2000)
         self._worker_tasks   = []
         self._ws_task        = asyncio.create_task(self._ws_listener(ctx))
         self._loop_task      = asyncio.create_task(self._main_loop(ctx))
@@ -583,6 +593,8 @@ class PumpFunSkill(BaseSkill):
                     self._ws_connected = True
                     logger.info("✅ WebSocket PumpPortal connecté — mode événementiel")
                     await ws.send(json.dumps({"method": "subscribeNewToken"}))
+                    # Pas de subscribeTokenTrade global — trop de messages
+                    # Le volume est tracké via les messages "buy"/"sell" reçus naturellement
 
                     async for raw in ws:
                         if not self._running:
@@ -592,13 +604,22 @@ class PumpFunSkill(BaseSkill):
                         except Exception:
                             continue
 
-                        if msg.get("txType") != "create":
+                        tx_type = msg.get("txType", "")
+                        mint    = msg.get("mint", "")
+
+                        # Tracker le volume sur TOUS les trades (pas seulement create)
+                        if mint and tx_type in ("create", "buy", "sell"):
+                            sol_amt = float(msg.get("solAmount", 0) or 0)
+                            if sol_amt > 0:
+                                sol_px_vol            = await self._get_sol_price()
+                                vol_usd               = sol_amt * sol_px_vol
+                                self._vol_tracker[mint] = self._vol_tracker.get(mint, 0) + vol_usd
+
+                        if tx_type != "create":
                             continue
 
-                        mint = msg.get("mint", "")
                         if not mint or mint in self._blacklist:
                             continue
-                        # Déduplication légère : éviter de remettre en queue un token déjà traité
                         if mint in self._seen_tokens:
                             continue
 
@@ -723,8 +744,19 @@ class PumpFunSkill(BaseSkill):
                             worker_id, symbol, mint[:8],
                             token.get("market_cap", 0), self._token_queue.qsize())
 
+                # ── Pré-filtre rapide : si le MC initial est très bas
+                # ET qu'on a déjà beaucoup de tokens en queue, on drop
+                # Pour éviter que la queue sature sur des tokens "morts"
+                mc_initial = float(token.get("market_cap", 0) or 0)
+                queue_pressure = self._token_queue.qsize()
+                # Si queue > 50 et MC < 10% de mc_min → skip sans poll
+                if queue_pressure > 30 and mc_initial < self.mc_min * 0.15:
+                    logger.info("W#%d SKIP queue saturée (%d) + MC trop bas $%.0f: %s",
+                                worker_id, queue_pressure, mc_initial, symbol)
+                    self._token_queue.task_done()
+                    continue
+
                 # ── 2. Polling MC — attendre la zone cible ────────
-                # Les tokens sont créés à ~$2-3K, on attend $10K-$20K
                 token_data = await self._poll_until_mc_zone(token, worker_id)
 
                 if token_data is None:
@@ -743,6 +775,31 @@ class PumpFunSkill(BaseSkill):
 
                 # ── 4. Filtres stricts ────────────────────────────
                 ok, reason = self._apply_filters(enriched)
+
+                if ok is None:
+                    # Rejet temporaire (volume insuffisant) — requeue dans 60s
+                    retry_count = enriched.get("_retry_count", 0) + 1
+                    max_retries = 4  # max 4 retries = 4min supplémentaires
+                    age_total   = time.time() - enriched.get("_queued_at", time.time())
+
+                    if retry_count <= max_retries and age_total < self._ws_buffer_ttl:
+                        enriched["_retry_count"] = retry_count
+                        enriched["_retry_after"] = time.time() + 60
+                        # Retirer de _seen_tokens pour permettre le retraitement
+                        self._seen_tokens.discard(mint)
+                        logger.info("W#%d RETRY %d/%d dans 60s: %s — %s",
+                                    worker_id, retry_count, max_retries, symbol, reason)
+                        await asyncio.sleep(60)
+                        try:
+                            self._token_queue.put_nowait(enriched)
+                        except asyncio.QueueFull:
+                            logger.warning("W#%d RETRY drop (queue pleine): %s", worker_id, symbol)
+                    else:
+                        logger.info("W#%d filtre définitif (max retries/TTL): %s — %s",
+                                    worker_id, symbol, reason)
+                    self._token_queue.task_done()
+                    continue
+
                 if not ok:
                     logger.info("W#%d filtre: %s — %s", worker_id, symbol, reason)
                     self._token_queue.task_done()
@@ -812,10 +869,16 @@ class PumpFunSkill(BaseSkill):
         mint   = token.get("address", "")
         symbol = token.get("symbol", "?")
 
+        logger.info("W#%d POLL START %s | zone $%.0f-$%.0f | max %d polls x %.0fs",
+                    worker_id, symbol, self.mc_min, self.mc_max,
+                    self._mc_poll_max, self._mc_poll_interval)
+
         for poll_n in range(self._mc_poll_max):
             # Vérifier TTL global
             age = time.time() - token.get("_queued_at", time.time())
             if age > self._ws_buffer_ttl:
+                logger.info("W#%d POLL TTL expiré %s (%.0fs > %ds)",
+                            worker_id, symbol, age, self._ws_buffer_ttl)
                 return None
 
             # Récupérer le MC actuel depuis Pump.fun
@@ -823,43 +886,94 @@ class PumpFunSkill(BaseSkill):
             if pf:
                 mc_usd = float(pf.get("usd_market_cap", 0) or 0)
                 token["market_cap"] = mc_usd
-
-                logger.debug("W#%d poll[%d] %s MC=$%.0f (zone $%.0f-$%.0f)",
-                             worker_id, poll_n, symbol,
-                             mc_usd, self.mc_min, self.mc_max)
+                logger.info("W#%d poll[%d/%d] %s MC=$%.0f (zone $%.0f-$%.0f)",
+                            worker_id, poll_n + 1, self._mc_poll_max, symbol,
+                            mc_usd, self.mc_min, self.mc_max)
 
                 if self.mc_min <= mc_usd <= self.mc_max:
-                    # ✅ Dans la zone — on enrichit complètement depuis cette réponse
-                    sol_px = await self._get_sol_price()
+                    sol_px  = await self._get_sol_price()
+                    # Pump.fun API ne retourne pas de volume — utiliser Moralis
+                    ws_vol      = self._vol_tracker.get(mint, 0)
+                    moralis     = await self._fetch_moralis_data(mint)
+                    moralis_vol = moralis.get("volume_24h", 0)
+                    moralis_liq = moralis.get("liquidity", 0)
+                    moralis_holders = moralis.get("holders", 0)
+
+                    # Volume : Moralis > WS tracker
+                    best_vol = moralis_vol if moralis_vol > 0 else ws_vol
+
+                    # Holders : Moralis (fiable) > pf.get (toujours 0)
+                    if moralis_holders > 0:
+                        pf["holder_count"] = moralis_holders
+
+                    # Injecter liquidité + variation holders dans le token
+                    if moralis_liq > 0:
+                        token["liquidity"] = moralis_liq
+                    if moralis.get("holders_change_1h") is not None:
+                        token["holders_change_1h"]  = moralis["holders_change_1h"]
+                        token["holders_change_24h"] = moralis.get("holders_change_24h", 0)
                     token.update({
-                        "holders":         int(pf.get("holder_count", 0) or 0),
-                        "snipers":         int(pf.get("sniper_count", pf.get("bot_holder_count", 0)) or 0),
-                        "dev_holding_pct": float(pf.get("creator_percentage", 0) or 0),
-                        "top10_pct":       float(pf.get("top10_pct", 0) or 0),
-                        "reply_count":     int(pf.get("reply_count", 0) or 0),
+                        "holders":           int(pf.get("holder_count", 0) or 0),
+                        "snipers":           int(pf.get("sniper_count", pf.get("bot_holder_count", 0)) or 0),
+                        "dev_holding_pct":   float(pf.get("creator_percentage", 0) or 0),
+                        "top10_pct":         float(pf.get("top10_pct", 0) or 0),
+                        "reply_count":       int(pf.get("reply_count", 0) or 0),
                         "bonding_curve_pct": float(pf.get("bonding_curve_percentage", 0) or 0),
-                        "description":     pf.get("description", token.get("description", "")),
-                        "twitter":         pf.get("twitter", ""),
-                        "telegram":        pf.get("telegram", ""),
-                        "website":         pf.get("website", ""),
-                        "volume_24h":      float(pf.get("volume", 0) or 0),
-                        "_source":         "pumpportal_ws",
+                        "description":       pf.get("description", token.get("description", "")),
+                        "twitter":           pf.get("twitter", ""),
+                        "telegram":          pf.get("telegram", ""),
+                        "website":           pf.get("website", ""),
+                        "volume_24h":        best_vol,   # depuis Moralis ou WS tracker
+                        "real_sol_reserves": float(pf.get("real_sol_reserves", 0) or 0),
+                        "virtual_sol_reserves": float(pf.get("virtual_sol_reserves", 0) or 0),
+                        "_source":           "pumpportal_ws",
                     })
-                    logger.info("W#%d 🎯 Zone MC atteinte: %s $%.0f après %d polls (%.0fs)",
-                                worker_id, symbol, mc_usd, poll_n,
-                                time.time() - token["_queued_at"])
+                    elapsed_s = time.time() - token["_queued_at"]
+                    logger.info("W#%d ✅ ZONE ATTEINTE: %s $%.0f après %d polls (%.0fs)",
+                                worker_id, symbol, mc_usd, poll_n + 1, elapsed_s)
+
+                    # Alerte Telegram immédiate dès l'entrée en zone MC
+                    if self.notify_mc_zone:
+                        try:
+                            holders_now = int(pf.get("holder_count", 0) or 0)
+                            bc_pct      = float(pf.get("bonding_curve_percentage", 0) or 0)
+                            age_str     = self._fmt_duration(int(elapsed_s))
+                            addr_short  = token.get("address", "")[:20]
+                            notif_lines = [
+                                "👀 **Zone MC** — `%s`" % symbol,
+                                "💰 MC: **$%s** | Holders: %d | BC: %.0f%%" % (
+                                    self._fmt_k(mc_usd), holders_now, bc_pct),
+                                "⏱ %s apres creation" % age_str,
+                                "🔍 Analyse en cours...",
+                                "`%s`" % token.get("address", ""),
+                            ]
+                            msg = "\n".join(notif_lines)
+                            await self._notify(msg)
+                        except Exception as e:
+                            logger.error("W#%d notif zone MC erreur: %s", worker_id, e)
+
                     return token
 
                 elif mc_usd > self.mc_max * 2:
-                    # A déjà trop pumpé — plus la peine d'attendre
-                    logger.debug("W#%d %s déjà trop haut ($%.0f > $%.0f) — abandon",
-                                 worker_id, symbol, mc_usd, self.mc_max * 2)
+                    logger.info("W#%d ABANDON trop haut: %s $%.0f > $%.0f",
+                                worker_id, symbol, mc_usd, self.mc_max * 2)
                     return None
 
-            # Attendre avant le prochain poll
+                # Abandon précoce : stagne trop bas trop longtemps
+                elif poll_n >= self._mc_poll_abandon_after and mc_usd < self.mc_min * self._mc_poll_abandon_pct:
+                    logger.info("W#%d ABANDON stagnation: %s $%.0f < $%.0f après %d polls",
+                                worker_id, symbol, mc_usd,
+                                self.mc_min * self._mc_poll_abandon_pct, poll_n + 1)
+                    return None
+
+            else:
+                logger.info("W#%d poll[%d/%d] %s — API Pump.fun indisponible",
+                            worker_id, poll_n + 1, self._mc_poll_max, symbol)
+
             await asyncio.sleep(self._mc_poll_interval)
 
-        # Max polls atteint sans entrer dans la zone
+        logger.info("W#%d ABANDON max polls atteint: %s (%d polls sans zone)",
+                    worker_id, symbol, self._mc_poll_max)
         return None
 
 
@@ -923,6 +1037,72 @@ class PumpFunSkill(BaseSkill):
             "website":    p.get("website", ""),
             "_source":    "gmgn",
         }
+
+    def _apply_filters(self, t: dict) -> tuple:
+        """
+        Applique les filtres Kabuki adaptés au mode événementiel.
+        Retourne (True, "") si OK, (False, raison) si rejeté définitivement,
+        ou (None, raison) si le token doit être retenté plus tard (ex: volume trop bas).
+        """
+        mc      = float(t.get("market_cap", 0) or 0)
+        vol     = float(t.get("volume_24h", 0) or 0)
+        holders = int(t.get("holders", 0) or 0)
+        snipers = int(t.get("snipers", 0) or 0)
+        dev_pct = float(t.get("dev_holding_pct", 0) or 0)
+        top10   = float(t.get("top10_pct", 0) or 0)
+        age_h   = float(t.get("age_hours", 0) or 0)
+        # Temps depuis que le token a été mis dans la queue (en minutes)
+        age_queued_min = (time.time() - t.get("_queued_at", time.time())) / 60
+
+        # ── MC dans la zone ───────────────────────────────────
+        if not (self.mc_min <= mc <= self.mc_max):
+            return False, "MC $%.0f hors zone $%.0f-$%.0f" % (mc, self.mc_min, self.mc_max)
+
+        # ── Volume — adapté à l'âge ───────────────────────────
+        # Tokens < 10min : seuil réduit à 20% (les échanges s'accumulent)
+        # Tokens 10-30min : seuil réduit à 50%
+        # Tokens > 30min : seuil plein
+        if age_queued_min < 10:
+            vol_threshold = self.volume_min * 0.20
+        elif age_queued_min < 30:
+            vol_threshold = self.volume_min * 0.50
+        else:
+            vol_threshold = self.volume_min
+
+        # Si volume = 0, essayer le vol WS comme dernier recours
+        if vol == 0:
+            ws_vol = self._vol_tracker.get(t.get("address", ""), 0)
+            if ws_vol > 0:
+                vol = ws_vol
+                logger.info("filtre: vol WS fallback %s $%.0f", t.get("symbol","?"), ws_vol)
+
+        if vol < vol_threshold:
+            # None = pas définitif, le volume peut encore monter → retry
+            return None, "Volume $%.0f < $%.0f (âge %.0fmin, seuil %.0f%%)" % (
+                vol, vol_threshold, age_queued_min,
+                vol_threshold / self.volume_min * 100)
+
+        # ── Holders ───────────────────────────────────────────
+        # Seuil réduit pour tokens très frais (< 5min)
+        holders_threshold = max(20, self.holders_min) if age_queued_min < 5 else self.holders_min
+        if holders < holders_threshold:
+            return False, "Holders %d < %d" % (holders, holders_threshold)
+
+        # ── Sécurité ──────────────────────────────────────────
+        if snipers > self.snipers_max:
+            return False, "Snipers %d > %d" % (snipers, self.snipers_max)
+        if dev_pct > self.dev_hold_max:
+            return False, "Dev %.1f%% > %.1f%%" % (dev_pct, self.dev_hold_max)
+        if top10 > self.top10_max:
+            return False, "Top10 %.1f%% > %.1f%%" % (top10, self.top10_max)
+        if age_h > self.age_max_hours:
+            return False, "Âge %.1fh > %.1fh" % (age_h, self.age_max_hours)
+
+        # ── Anti wash-trading ─────────────────────────────────
+        if holders > 0 and vol / holders > 5000:
+            return False, "Wash trading suspect (vol/holder=$%.0f)" % (vol / holders)
+
+        return True, ""
 
     async def _enrich_token(self, token: dict) -> Optional[dict]:
         """
@@ -1011,19 +1191,115 @@ class PumpFunSkill(BaseSkill):
         return t
 
     async def _fetch_pumpfun_coin(self, addr: str) -> Optional[dict]:
-        """Récupère les détails d'un token depuis l'API Pump.fun"""
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    "%s/coins/%s" % (PUMPFUN_API, addr),
-                    timeout=aiohttp.ClientTimeout(total=10),
-                    headers={"User-Agent": "Mozilla/5.0"},
-                ) as r:
-                    if r.status == 200:
-                        return await r.json(content_type=None)
-        except Exception as e:
-            logger.debug("fetch_pumpfun_coin %s: %s", addr[:16], e)
+        """
+        Récupère les détails d'un token depuis l'API Pump.fun.
+        Essaie plusieurs endpoints en cascade car les APIs sont instables.
+        """
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+            "Origin": "https://pump.fun",
+            "Referer": "https://pump.fun/",
+        }
+        # Endpoints par ordre de priorité
+        urls = [
+            "https://frontend-api-v3.pump.fun/coins/%s" % addr,
+            "https://frontend-api-v2.pump.fun/coins/%s" % addr,
+            "https://frontend-api.pump.fun/coins/%s" % addr,
+        ]
+        async with aiohttp.ClientSession() as session:
+            for url in urls:
+                try:
+                    async with session.get(
+                        url,
+                        timeout=aiohttp.ClientTimeout(total=8),
+                        headers=headers,
+                    ) as r:
+                        if r.status == 200:
+                            data = await r.json(content_type=None)
+                            if data and isinstance(data, dict) and data.get("mint"):
+                                return data
+                        elif r.status not in (503, 530):
+                            # Erreur inattendue — log et essayer suivant
+                            logger.debug("fetch_pumpfun_coin %s HTTP %d via %s",
+                                         addr[:12], r.status, url.split("/")[2])
+                except Exception as e:
+                    logger.debug("fetch_pumpfun_coin %s erreur %s: %s",
+                                 addr[:12], url.split("/")[2], e)
         return None
+
+    async def _fetch_moralis_data(self, addr: str) -> dict:
+        """
+        Récupère en parallèle depuis Moralis :
+        - /token/mainnet/{addr}/pairs   → volume24h, liquidité, prix
+        - /token/mainnet/holders/{addr} → totalHolders, holderChange 1h/24h
+
+        Retourne un dict consolidé avec toutes les métriques.
+        """
+        if not self.moralis_key:
+            return {}
+
+        headers = {"accept": "application/json", "X-API-Key": self.moralis_key}
+        timeout = aiohttp.ClientTimeout(total=8)
+        result  = {}
+
+        async def _get(session, url, key):
+            try:
+                async with session.get(url, headers=headers, timeout=timeout) as r:
+                    if r.status == 200:
+                        return key, await r.json(content_type=None)
+                    logger.debug("Moralis %s HTTP %d", url.split("/")[-1], r.status)
+            except Exception as e:
+                logger.debug("Moralis %s: %s", key, e)
+            return key, None
+
+        async with aiohttp.ClientSession() as session:
+            tasks = [
+                _get(session, "%s/token/mainnet/%s/pairs?limit=10" % (MORALIS_SOL_GW, addr), "pairs"),
+                _get(session, "%s/token/mainnet/holders/%s" % (MORALIS_SOL_GW, addr), "holders"),
+            ]
+            responses = await asyncio.gather(*tasks)
+
+        for key, data in responses:
+            if not data:
+                continue
+
+            if key == "pairs":
+                total_vol = 0.0
+                total_liq = 0.0
+                best_price = 0.0
+                for p in (data.get("pairs") or []):
+                    if p.get("inactivePair"):
+                        continue
+                    total_vol  += float(p.get("volume24hrUsd", 0) or 0)
+                    total_liq  += float(p.get("liquidityUsd",  0) or 0)
+                    px = float(p.get("usdPrice", 0) or 0)
+                    if px > best_price:
+                        best_price = px
+                result["volume_24h"] = total_vol
+                result["liquidity"]  = total_liq
+                result["price_usd"]  = best_price
+
+            elif key == "holders":
+                result["holders"]          = int(data.get("totalHolders", 0) or 0)
+                hc = data.get("holderChange", {})
+                result["holders_change_1h"]  = float((hc.get("1h")  or {}).get("change", 0) or 0)
+                result["holders_change_24h"] = float((hc.get("24h") or {}).get("change", 0) or 0)
+                # Distribution pour détecter la concentration
+                dist = data.get("holdersByAcquisition", {})
+                result["holders_by_swap"]    = int(dist.get("swap", 0) or 0)
+
+        if result:
+            logger.info("Moralis %s → vol=$%.0f holders=%d liq=$%.0f",
+                        addr[:12],
+                        result.get("volume_24h", 0),
+                        result.get("holders", 0),
+                        result.get("liquidity", 0))
+        return result
+
+    # Alias pour compatibilité
+    async def _fetch_moralis_volume(self, addr: str) -> dict:
+        return await self._fetch_moralis_data(addr)
 
     async def _fetch_rugcheck(self, addr: str) -> Optional[dict]:
         """Récupère le RugCheck score d'un token Solana"""
@@ -1058,7 +1334,7 @@ class PumpFunSkill(BaseSkill):
                 "symbol":          pf.get("symbol", "?"),
                 "name":            pf.get("name", "?"),
                 "market_cap":      float(pf.get("usd_market_cap", 0) or 0),
-                "volume_24h":      float(pf.get("volume", 0) or 0),
+                "volume_24h":      token.get("volume_24h", 0),  # hérité de Moralis via poll
                 "holders":         int(pf.get("holder_count", 0) or 0),
                 "snipers":         int(pf.get("sniper_count", pf.get("bot_holder_count", 0)) or 0),
                 "dev_holding_pct": float(pf.get("creator_percentage", pf.get("dev_holding_pct", 0)) or 0),
@@ -1971,11 +2247,16 @@ Volume croissant vs MC, bonding curve progression, replies récents, signes de c
         self._save_state()
 
     def _check_daily_reset(self):
-        """Remet à zéro le P&L journalier à minuit"""
+        """Remet à zéro le P&L journalier à minuit + nettoie le vol_tracker"""
         today = datetime.now().strftime("%Y-%m-%d")
         if self._daily_pnl_date != today:
             self._daily_pnl_date = today
             self._daily_pnl      = 0.0
+            # Nettoyer le tracker de volume (garder seulement les tokens en position)
+            active = set(self._positions.keys()) | self._seen_tokens
+            before = len(self._vol_tracker)
+            self._vol_tracker = {k: v for k, v in self._vol_tracker.items() if k in active}
+            logger.info("vol_tracker nettoyé: %d → %d entrées", before, len(self._vol_tracker))
 
     # ══════════════════════════════════════════════════════════════
     #   PRIX EN TEMPS RÉEL

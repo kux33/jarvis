@@ -1381,9 +1381,6 @@ class PumpFunSkill(BaseSkill):
         mc             = t.get("market_cap", 0)
         vol            = t.get("volume_24h", 0)
         holders        = t.get("holders", 0)
-        snipers        = t.get("snipers", "N/A")
-        dev_pct        = t.get("dev_holding_pct", "N/A")
-        top10          = t.get("top10_pct", "N/A")
         age_str        = t.get("age_str", "?")
         bc_pct         = t.get("bonding_curve_pct", 0)
         reply_count    = t.get("reply_count", 0)
@@ -1391,11 +1388,37 @@ class PumpFunSkill(BaseSkill):
         twitter        = t.get("twitter", "")
         telegram       = t.get("telegram", "")
         website        = t.get("website", "")
-        rug_score      = t.get("rugcheck_score", "N/A")
-        rug_risks      = ", ".join(t.get("rugcheck_risks", [])) or "aucun détecté"
         vol_per_holder = vol / holders if holders > 0 else 0
 
+        # ── Distinguer "donnée absente = vrai red flag" vs "API timeout = neutre" ──
+        # Snipers, dev_holding, top10 viennent de RugCheck/Moralis — souvent timeout
+        raw_snipers = t.get("snipers", None)
+        raw_dev     = t.get("dev_holding_pct", None)
+        raw_top10   = t.get("top10_pct", None)
+        raw_rug_score  = t.get("rugcheck_score", None)
+        raw_rug_risks  = t.get("rugcheck_risks", None)
+
+        snipers_str   = str(raw_snipers)        if raw_snipers not in (None, "N/A") else "non récupéré (API timeout — traiter en NEUTRE)"
+        dev_str       = f"{raw_dev}%%"           if raw_dev     not in (None, "N/A") else "non récupéré (API timeout — traiter en NEUTRE)"
+        top10_str     = f"{raw_top10}%%"         if raw_top10   not in (None, "N/A") else "non récupéré (API timeout — traiter en NEUTRE)"
+        rug_score_str = str(raw_rug_score)       if raw_rug_score not in (None, "N/A") else "non récupéré (API timeout — traiter en NEUTRE)"
+        rug_risks_str = ", ".join(raw_rug_risks) if raw_rug_risks else "aucun détecté"
+
+        # Les liens sociaux absents = vrai red flag (le token n'a tout simplement pas de socials)
+        has_socials = bool(twitter or telegram or website)
+        socials_str = (
+            f"Twitter={twitter or 'non'} | TG={telegram or 'non'} | Site={website or 'non'}"
+            if has_socials
+            else "AUCUN lien social (red flag — pénaliser)"
+        )
+        # Description absente = vrai red flag
+        desc_str = description if description else "AUCUNE description (red flag — pénaliser)"
+
         prompt = """Tu es un expert en analyse de memecoins sur Pump.fun (Solana). Tu dois scorer ce token de 0 à 100.
+
+RÈGLE CRITIQUE sur les données manquantes :
+- "non récupéré (API timeout)" = donnée indisponible pour raison technique → traiter en NEUTRE (ni bonus ni malus)
+- "AUCUN lien social" ou "AUCUNE description" = le token n'a vraiment pas ces éléments → vrai red flag, pénaliser normalement
 
 ## Token à analyser
 - **Ticker/Name**: %s / %s
@@ -1405,27 +1428,31 @@ class PumpFunSkill(BaseSkill):
 - **Volume 24h**: $%s (ratio vol/holder: $%.0f)
 - **Holders**: %d
 - **Snipers**: %s
-- **Dev Holdings**: %s%%
-- **Top 10 Holders**: %s%%
+- **Dev Holdings**: %s
+- **Top 10 Holders**: %s
 - **Bonding Curve**: %.1f%%
 - **Replies Pump.fun**: %d
 - **RugCheck Score**: %s (risques: %s)
-- **Liens**: Twitter=%s | TG=%s | Site=%s
+- **Liens**: %s
 - **Description/Narrative**: %s
 
 ## Critères de scoring (total 100 pts)
 
 ### 1. Engagement organique vs bot/spam (30 pts)
-Évalue si l'activité est réelle : ratio volume/holders, nombre de replies, diversité des wallets, absence de wash trading évident.
+Évalue si l'activité est réelle : ratio volume/holders, nombre de replies, diversité des wallets.
+Si une donnée est "non récupéré (API timeout)", ignore-la complètement pour ce critère.
 
 ### 2. Potentiel viral / thème fort (30 pts)
-Analyse le nom, ticker, description, narrative. Est-ce un thème d'actualité ? Artwork mémorable ? Timing bon ? Lien avec une tendance culturelle/crypto ?
+Analyse le nom, ticker, description, narrative. Est-ce un thème d'actualité ? Timing bon ?
+Absence de description ou de socials = pénaliser fort (max 10/30).
 
 ### 3. Risque rug / concentration wallets (20 pts)
-Dev holdings, top 10 concentration, snipers, RugCheck risks, signaux d'alerte.
+Dev holdings, top 10 concentration, snipers, RugCheck risks.
+Si les données sont "non récupéré (API timeout)" → attribuer 10/20 (neutre).
+Si RugCheck détecte des risques réels → pénaliser normalement.
 
 ### 4. Momentum (20 pts)
-Volume croissant vs MC, bonding curve progression, replies récents, signes de croissance organique.
+Volume vs MC, bonding curve progression, replies récents.
 
 ## Format de réponse (JSON strict, aucun texte avant ou après)
 {
@@ -1447,11 +1474,11 @@ Volume croissant vs MC, bonding curve progression, replies récents, signes de c
             symbol, name, addr[:20] + "...",
             age_str,
             self._fmt_k(mc), self._fmt_k(vol), vol_per_holder,
-            holders, snipers, dev_pct, top10,
+            holders, snipers_str, dev_str, top10_str,
             bc_pct, reply_count,
-            rug_score, rug_risks,
-            twitter or "non", telegram or "non", website or "non",
-            description or "Aucune description",
+            rug_score_str, rug_risks_str,
+            socials_str,
+            desc_str,
         )
 
         # ── Appel API Anthropic ───────────────────────────────

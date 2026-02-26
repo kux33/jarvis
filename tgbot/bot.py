@@ -150,6 +150,8 @@ class JarvisTelegramBot:
             await self.app.bot.send_message(chat_id=user_id, text=text, parse_mode=ParseMode.MARKDOWN)
         except Exception as e:
             logger.error(f"Erreur envoi message à {user_id}: {e}")
+
+    async def _on_shell(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not await self._check_auth(update):
             return
         cmd = " ".join(ctx.args) if ctx.args else ""

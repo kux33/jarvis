@@ -162,6 +162,7 @@ class PumpFunSkill(BaseSkill):
         self._loop_task       = None
         self._context         = None
         self._send_callback   = None
+        self._notify_user_id: int = 0   # user_id stocké au /pumpstart pour alertes proactives
 
         # Données
         self._alerts_log: list   = []       # Toutes les alertes envoyées
@@ -276,6 +277,7 @@ class PumpFunSkill(BaseSkill):
                 "Le scan peut quand même tourner (score désactivé)."
             )
         self._running        = True
+        self._notify_user_id = ctx.user_id   # stocker pour alertes TP/SL proactives
         self._token_queue    = asyncio.Queue(maxsize=2000)
         self._worker_tasks   = []
         self._ws_task        = asyncio.create_task(self._ws_listener(ctx))
@@ -2227,22 +2229,47 @@ Volume vs MC, bonding curve progression, replies récents.
 
             # ── STOP LOSS ─────────────────────────────────────
             if cur_price <= sl_price and sl_price > 0:
-                pnl, _ = await self._close_position(addr, cur_price, reason="Stop Loss")
-                await self._notify(
-                    "🛑 **STOP LOSS déclenché**\n"
-                    "🪙 **%s** | Prix: $%.6f\n"
-                    "📉 x%.2f | P&L: **$%+.2f**\n"
-                    "SL atteint à -%.0f%%"
-                    % (symbol, cur_price, mult, pnl, self.sl * 100)
-                )
+                tp1_was_hit   = pos.get("tp1_hit", False)
+                tp2_was_hit   = pos.get("tp2_hit", False)
+                pnl_already   = self._total_pnl  # snapshot avant fermeture
+                pnl, _        = await self._close_position(addr, cur_price, reason="Stop Loss")
+                # Si TP1 ou TP2 avaient déjà été touchés, le SL est au breakeven ou TP1
+                # → afficher le P&L net total de la position
+                if tp1_was_hit or tp2_was_hit:
+                    pnl_total_pos = (self._total_pnl - pnl_already) + pnl
+                    amount_init   = pos.get("amount_usd", 0)
+                    tp_status     = "après TP1+TP2" if tp2_was_hit else "après TP1"
+                    await self._notify(
+                        "🛑 **STOP LOSS déclenché** (%s)\n"
+                        "🪙 **%s** | Prix: $%.6f\n"
+                        "📉 x%.2f | P&L restant: **$%+.2f**\n"
+                        "💰 P&L net total position: **$%+.2f** (mise $%.2f)\n"
+                        "✅ Capital protégé grâce aux TP partiels"
+                        % (tp_status, symbol, cur_price, mult, pnl, pnl_total_pos, amount_init)
+                    )
+                else:
+                    await self._notify(
+                        "🛑 **STOP LOSS déclenché**\n"
+                        "🪙 **%s** | Prix: $%.6f\n"
+                        "📉 x%.2f | P&L: **$%+.2f**\n"
+                        "SL atteint à -%.0f%%"
+                        % (symbol, cur_price, mult, pnl, self.sl * 100)
+                    )
                 continue
 
             # ── TAKE PROFIT 1 (x2 → vendre 40%) ──────────────
             if not pos.get("tp1_hit") and cur_price >= pos.get("tp1_price", float("inf")):
-                shares_sell = remaining_shares * 0.40
-                pnl_partial = shares_sell * (cur_price - entry_price)
-                self._positions[addr]["tp1_hit"]        = True
-                self._positions[addr]["remaining_shares"] = remaining_shares - shares_sell
+                total_shares   = pos.get("shares", remaining_shares)
+                shares_sell    = total_shares * 0.40
+                # Coût réel des shares vendues (proportionnel à la mise initiale)
+                cost_sell      = pos.get("amount_usd", 0) * (shares_sell / total_shares) if total_shares > 0 else 0
+                pnl_partial    = (shares_sell * cur_price) - cost_sell
+                remaining_after = remaining_shares - shares_sell
+                # Coût restant pour les shares encore en jeu
+                cost_remaining = pos.get("amount_usd", 0) * (remaining_after / total_shares) if total_shares > 0 else 0
+                self._positions[addr]["tp1_hit"]           = True
+                self._positions[addr]["remaining_shares"]  = remaining_after
+                self._positions[addr]["amount_usd_remaining"] = cost_remaining
                 # Remonter le SL au breakeven
                 self._positions[addr]["sl_price"] = entry_price * 1.01
                 self._record_partial_pnl(pnl_partial)
@@ -2258,11 +2285,19 @@ Volume vs MC, bonding curve progression, replies récents.
 
             # ── TAKE PROFIT 2 (x3 → vendre 35%) ──────────────
             elif pos.get("tp1_hit") and not pos.get("tp2_hit") and cur_price >= pos.get("tp2_price", float("inf")):
-                remaining_now = self._positions[addr].get("remaining_shares", remaining_shares)
-                shares_sell   = remaining_now * 0.583  # 35% du total original
-                pnl_partial   = shares_sell * (cur_price - entry_price)
-                self._positions[addr]["tp2_hit"]        = True
-                self._positions[addr]["remaining_shares"] = remaining_now - shares_sell
+                remaining_now  = self._positions[addr].get("remaining_shares", remaining_shares)
+                total_shares   = pos.get("shares", remaining_now)
+                shares_sell    = remaining_now * 0.583  # ~35% du total original
+                # Coût réel des shares vendues depuis amount_usd_remaining (post-TP1)
+                cost_remaining_tp1 = self._positions[addr].get("amount_usd_remaining",
+                    pos.get("amount_usd", 0) * (remaining_now / total_shares) if total_shares > 0 else 0)
+                cost_sell      = cost_remaining_tp1 * (shares_sell / remaining_now) if remaining_now > 0 else 0
+                pnl_partial    = (shares_sell * cur_price) - cost_sell
+                remaining_after = remaining_now - shares_sell
+                cost_remaining2 = cost_remaining_tp1 - cost_sell
+                self._positions[addr]["tp2_hit"]              = True
+                self._positions[addr]["remaining_shares"]     = remaining_after
+                self._positions[addr]["amount_usd_remaining"] = cost_remaining2
                 # Remonter le SL à TP1
                 self._positions[addr]["sl_price"] = pos.get("tp1_price", entry_price * self.tp1) * 0.95
                 self._record_partial_pnl(pnl_partial)
@@ -2278,13 +2313,19 @@ Volume vs MC, bonding curve progression, replies récents.
 
             # ── TAKE PROFIT 3 (x5 → vendre tout) ─────────────
             elif pos.get("tp2_hit") and not pos.get("tp3_hit") and cur_price >= pos.get("tp3_price", float("inf")):
+                # P&L déjà réalisé sur TP1 + TP2 (pour affichage total)
+                pnl_already   = self._total_pnl  # snapshot avant fermeture
                 pnl, mult_final = await self._close_position(addr, cur_price, reason="TP3 x%.1f" % self.tp3)
+                pnl_total_pos = (self._total_pnl - pnl_already) + pnl  # TP1+TP2+TP3
+                amount_init   = pos.get("amount_usd", 0)
+                roi_pct       = (pnl_total_pos / amount_init * 100) if amount_init > 0 else 0
                 await self._notify(
                     "🏆🏆 **TP3 — MOON ATTEINT !**\n"
                     "🪙 **%s** x%.1f @ $%.6f\n"
-                    "💰 Position fermée | P&L total: **$%+.2f**\n"
+                    "💰 TP3 final: **$%+.2f** | P&L total position: **$%+.2f** (+%.0f%%)\n"
+                    "📊 Mise initiale: $%.2f\n"
                     "🎉 LFG !"
-                    % (symbol, mult_final, cur_price, pnl)
+                    % (symbol, mult_final, cur_price, pnl, pnl_total_pos, roi_pct, amount_init)
                 )
 
     async def _close_position(self, addr: str, cur_price: float, reason: str = "") -> tuple:
@@ -2296,33 +2337,38 @@ Volume vs MC, bonding curve progression, replies récents.
         if not pos:
             return 0.0, 1.0
 
-        entry_price = pos.get("entry_price", cur_price)
-        amount_usd  = pos.get("amount_usd", 0)
-        shares      = pos.get("remaining_shares", pos.get("shares", 0))
-        symbol      = pos.get("symbol", "?")
-        opened_at   = pos.get("opened_at", "?")
-        held_h      = (time.time() - pos.get("timestamp", time.time())) / 3600
-        paper       = pos.get("paper", True)
+        entry_price  = pos.get("entry_price", cur_price)
+        amount_usd   = pos.get("amount_usd", 0)
+        shares       = pos.get("remaining_shares", pos.get("shares", 0))
+        symbol       = pos.get("symbol", "?")
+        opened_at    = pos.get("opened_at", "?")
+        held_h       = (time.time() - pos.get("timestamp", time.time())) / 3600
+        paper        = pos.get("paper", True)
+
+        # Utiliser le coût restant réel si des TP partiels ont déjà eu lieu
+        # Evite de soustraire la mise initiale entière alors qu'une partie a déjà été récupérée
+        cost_basis   = pos.get("amount_usd_remaining", amount_usd)
 
         payout = shares * cur_price
-        pnl    = payout - amount_usd
+        pnl    = payout - cost_basis
         mult   = cur_price / entry_price if entry_price > 0 else 1.0
 
         # Enregistrer
         self._closed_trades.append({
-            "symbol":     symbol,
-            "address":    addr,
+            "symbol":      symbol,
+            "address":     addr,
             "entry_price": entry_price,
-            "exit_price": cur_price,
-            "amount_usd": amount_usd,
-            "payout":     payout,
-            "pnl":        pnl,
-            "multiplier": mult,
-            "reason":     reason,
-            "opened_at":  opened_at,
-            "closed_at":  datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "held_hours": round(held_h, 1),
-            "paper":      paper,
+            "exit_price":  cur_price,
+            "amount_usd":  amount_usd,   # mise initiale (pour référence)
+            "cost_basis":  cost_basis,   # coût réel des shares restantes
+            "payout":      payout,
+            "pnl":         pnl,
+            "multiplier":  mult,
+            "reason":      reason,
+            "opened_at":   opened_at,
+            "closed_at":   datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "held_hours":  round(held_h, 1),
+            "paper":       paper,
         })
 
         self._total_pnl  += pnl
@@ -2795,11 +2841,17 @@ Volume vs MC, bonding curve progression, replies récents.
 
     async def _notify(self, text: str):
         """Envoie une notification proactive via Telegram"""
-        if self._send_callback and self._context:
+        if not self._send_callback:
+            return
+        # Priorité : user_id stocké au /pumpstart, fallback sur le contexte courant
+        uid = self._notify_user_id or (self._context.user_id if self._context else 0)
+        if uid:
             try:
-                await self._send_callback(self._context.user_id, text)
+                await self._send_callback(uid, text)
             except Exception as e:
                 logger.error("notify: %s", e)
+        else:
+            logger.warning("_notify: aucun user_id disponible, message perdu: %s", text[:50])
 
     @staticmethod
     def _fmt_k(n) -> str:

@@ -198,6 +198,13 @@ class PumpFunSkill(BaseSkill):
         self._n_workers: int     = int(os.getenv("PUMP_WORKERS", "8"))
         # TTL : ignorer un token si pas traité dans ce délai
         self._ws_buffer_ttl: int = int(os.getenv("PUMP_TOKEN_TTL", "900"))  # 15min défaut
+
+        # Cache de prix temps réel alimenté par le WS (addr -> {price, ts})
+        self._ws_price_cache: dict = {}
+        # Tokens actuellement souscrits via subscribeTokenTrade
+        self._ws_subscribed_positions: set = set()
+        # Référence au websocket actif (pour envoyer des souscriptions dynamiques)
+        self._ws_ref = None
         # Délai de polling MC pour attendre la zone cible (en secondes)
         self._mc_poll_interval: float = float(os.getenv("PUMP_MC_POLL", "15"))
         self._mc_poll_max: int        = int(os.getenv("PUMP_MC_POLL_MAX", "12"))  # 12 polls × 15s = ~3min
@@ -543,32 +550,38 @@ class PumpFunSkill(BaseSkill):
 
     async def _main_loop(self, ctx: SkillContext):
         """
-        Boucle principale allégée — plus de scan cyclique.
-        Se charge uniquement de :
-        - Surveiller les positions ouvertes (TP/SL) toutes les 30s
-        - Reset P&L journalier
-        - Maintenir les stats de session
-        Le traitement des tokens est géré par les workers événementiels.
+        Boucle principale :
+        - Surveiller les positions ouvertes (TP/SL) toutes les 5s
+          -> utilise le cache de prix WS si dispo, sinon appel API
+        - Reset P&L journalier toutes les 60s
+        - Synchroniser les souscriptions WS aux tokens en position
+        Le traitement des tokens est gere par les workers evenementiels.
         """
         self._context = ctx
-        logger.info("Main loop démarrée — monitoring positions toutes les 30s")
+        logger.info("Main loop demarree — monitoring positions toutes les 5s")
+
+        _last_daily_check = 0
 
         while self._running:
             try:
-                await asyncio.sleep(30)
+                await asyncio.sleep(5)
 
                 if self._positions and self.trade_mode != "off":
+                    await self._sync_ws_subscriptions()
                     await self._monitor_positions()
 
-                self._check_daily_reset()
+                now = time.time()
+                if now - _last_daily_check > 60:
+                    self._check_daily_reset()
+                    _last_daily_check = now
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error("Erreur main loop: %s", e)
-                await asyncio.sleep(10)
+                await asyncio.sleep(5)
 
-        logger.info("Main loop arrêtée")
+        logger.info("Main loop arretee")
 
     async def _ws_listener(self, ctx: SkillContext):
         """
@@ -593,10 +606,18 @@ class PumpFunSkill(BaseSkill):
                     close_timeout=5,
                 ) as ws:
                     self._ws_connected = True
+                    self._ws_ref = ws
                     logger.info("✅ WebSocket PumpPortal connecté — mode événementiel")
                     await ws.send(json.dumps({"method": "subscribeNewToken"}))
                     # Pas de subscribeTokenTrade global — trop de messages
                     # Le volume est tracké via les messages "buy"/"sell" reçus naturellement
+
+                    # Re-souscrire aux positions ouvertes après reconnexion
+                    if self._positions:
+                        addrs = list(self._positions.keys())
+                        await ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": addrs}))
+                        self._ws_subscribed_positions = set(addrs)
+                        logger.info("Re-souscription WS pour %d positions", len(addrs))
 
                     async for raw in ws:
                         if not self._running:
@@ -616,6 +637,14 @@ class PumpFunSkill(BaseSkill):
                                 sol_px_vol            = await self._get_sol_price()
                                 vol_usd               = sol_amt * sol_px_vol
                                 self._vol_tracker[mint] = self._vol_tracker.get(mint, 0) + vol_usd
+
+                            # Mettre à jour le cache de prix pour les positions ouvertes
+                            if mint in self._positions:
+                                mc_sol = float(msg.get("marketCapSol", 0) or 0)
+                                if mc_sol > 0:
+                                    sol_px = await self._get_sol_price()
+                                    price  = (mc_sol * sol_px) / 1_000_000_000
+                                    self._ws_price_cache[mint] = {"price": price, "ts": time.time()}
 
                         if tx_type != "create":
                             continue
@@ -663,6 +692,8 @@ class PumpFunSkill(BaseSkill):
                 break
             except Exception as e:
                 self._ws_connected = False
+                self._ws_ref = None
+                self._ws_subscribed_positions = set()
                 logger.warning("WS déconnecté: %s — reconnexion dans %ds", e, RECONNECT_DELAY)
                 await asyncio.sleep(RECONNECT_DELAY)
 
@@ -2126,11 +2157,45 @@ Volume vs MC, bonding curve progression, replies récents.
                 )
             )
 
+    async def _sync_ws_subscriptions(self):
+        """
+        S'assure que toutes les positions ouvertes sont souscrites via WS
+        pour recevoir les prix en temps réel sans appel API.
+        """
+        if not self._ws_ref or not self._positions:
+            return
+        current_addrs = set(self._positions.keys())
+        # Nouvelles positions à souscrire
+        to_sub = current_addrs - self._ws_subscribed_positions
+        if to_sub:
+            try:
+                await self._ws_ref.send(json.dumps({
+                    "method": "subscribeTokenTrade",
+                    "keys": list(to_sub)
+                }))
+                self._ws_subscribed_positions |= to_sub
+                logger.info("WS souscription prix: %s", [a[:8] for a in to_sub])
+            except Exception as e:
+                logger.debug("sync_ws_subscriptions: %s", e)
+        # Positions fermées à désouscrire
+        to_unsub = self._ws_subscribed_positions - current_addrs
+        if to_unsub:
+            try:
+                await self._ws_ref.send(json.dumps({
+                    "method": "unsubscribeTokenTrade",
+                    "keys": list(to_unsub)
+                }))
+                self._ws_subscribed_positions -= to_unsub
+                logger.info("WS désouscription prix: %s", [a[:8] for a in to_unsub])
+            except Exception as e:
+                logger.debug("sync_ws_unsubscribe: %s", e)
+
     async def _monitor_positions(self):
         """
         Vérifie le prix actuel de chaque position ouverte.
+        Utilise le cache WS (temps réel) en priorité, API en fallback si cache > 10s.
         Déclenche TP partiels ou SL selon les niveaux atteints.
-        Appelé à chaque cycle depuis _main_loop.
+        Appelé toutes les 5s depuis _main_loop.
         """
         if not self._positions:
             return
@@ -2140,7 +2205,13 @@ Volume vs MC, bonding curve progression, replies récents.
             if not pos:
                 continue
 
-            cur_price = await self._get_token_price(addr)
+            # Utiliser le cache WS en priorité (mis à jour en temps réel)
+            # Fallback API si cache absent ou trop vieux (>10s sans trade)
+            cached = self._ws_price_cache.get(addr)
+            if cached and (time.time() - cached["ts"]) < 10:
+                cur_price = cached["price"]
+            else:
+                cur_price = await self._get_token_price(addr)
             if cur_price <= 0:
                 continue
 

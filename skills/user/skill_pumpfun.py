@@ -223,10 +223,12 @@ class PumpFunSkill(BaseSkill):
 
     # ── JARVIS Interface ─────────────────────────────────────────
 
+    def set_send_callback(self, callback):
+        """Injecté par bot.py pour envoyer des messages Telegram proactifs"""
+        self._send_callback = callback
+
     async def handle(self, command: str, args: str, context) -> str:
         self._context = context
-        if hasattr(context, "send_message"):
-            self._send_callback = context.send_message
 
         routes = {
             "pumpstart":      self._cmd_start,
@@ -2721,10 +2723,10 @@ Volume vs MC, bonding curve progression, replies récents.
     # ══════════════════════════════════════════════════════════════
 
     async def _notify(self, text: str):
-        """Envoie une notification proactive via le contexte JARVIS"""
+        """Envoie une notification proactive via Telegram"""
         if self._send_callback and self._context:
             try:
-                await self._send_callback(self._context, text)
+                await self._send_callback(self._context.user_id, text)
             except Exception as e:
                 logger.error("notify: %s", e)
 

@@ -199,6 +199,11 @@ class JarvisTelegramBot:
         rappel_skill = self.agent.skill_manager._skills.get("rappel")
         if rappel_skill and hasattr(rappel_skill, "set_send_callback"):
             rappel_skill.set_send_callback(self.send_message)
+
+        # Injecter le callback d'envoi dans la skill pumpfun (si chargée)
+        pumpfun_skill = self.agent.skill_manager._skills.get("pumpfun")
+        if pumpfun_skill and hasattr(pumpfun_skill, "set_send_callback"):
+            pumpfun_skill.set_send_callback(self.send_message)
         
         async with self.app:
             await self.app.bot.set_my_commands(commands)

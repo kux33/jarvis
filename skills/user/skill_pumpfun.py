@@ -194,6 +194,10 @@ class PumpFunSkill(BaseSkill):
 
         # Queue événementielle : WS → workers (remplace le buffer passif)
         self._token_queue: asyncio.Queue = asyncio.Queue(maxsize=2000)
+        # Nouvelle architecture : séparation polling / scoring
+        self._pending_polls: dict        = {}   # addr → token (tous les tokens en attente de MC)
+        self._score_queue: asyncio.Queue = asyncio.Queue(maxsize=500)  # tokens prêts à scorer
+        self._poll_task                  = None
         # Pool de workers concurrents pour enrichissement + scoring
         self._worker_tasks: list = []
         self._n_workers: int     = int(os.getenv("PUMP_WORKERS", "8"))
@@ -279,10 +283,13 @@ class PumpFunSkill(BaseSkill):
         self._running        = True
         self._notify_user_id = ctx.user_id   # stocker pour alertes TP/SL proactives
         self._token_queue    = asyncio.Queue(maxsize=2000)
+        self._pending_polls  = {}
+        self._score_queue    = asyncio.Queue(maxsize=500)
         self._worker_tasks   = []
         self._ws_task        = asyncio.create_task(self._ws_listener(ctx))
         self._loop_task      = asyncio.create_task(self._main_loop(ctx))
-        # Lancer le pool de workers événementiels
+        self._poll_task      = asyncio.create_task(self._poll_dispatcher(ctx))
+        # Lancer le pool de workers événementiels (scoring uniquement)
         for i in range(self._n_workers):
             t = asyncio.create_task(self._token_worker(i, ctx))
             self._worker_tasks.append(t)
@@ -316,6 +323,9 @@ class PumpFunSkill(BaseSkill):
         if not self._running:
             return "⚠️ Scanner pas actif."
         self._running = False
+        if self._poll_task:
+            self._poll_task.cancel()
+            self._poll_task = None
         if self._ws_task:
             self._ws_task.cancel()
             self._ws_task = None
@@ -344,7 +354,7 @@ class PumpFunSkill(BaseSkill):
             "📡 **Pump.fun Scanner Status**\n━━━━━━━━━━━━━━━",
             "🔘 Scanner: %s | WebSocket: %s" % (status, ws_status),
             "⚡ Mode: événementiel | %d workers | TTL: %ds" % (self._n_workers, self._ws_buffer_ttl),
-            "📥 Queue: %d tokens en attente" % self._token_queue.qsize(),
+            "📥 En attente poll: %d | Prêts scoring: %d" % (len(self._pending_polls), self._score_queue.qsize()),
             "📊 Stats: %d reçus → %d traités → %d filtrés → %d scorés → %d alertes" % (
                 self._stats_received, self._stats_processed,
                 self._stats_filtered, self._stats_scored, self._stats_alerted),
@@ -727,78 +737,24 @@ class PumpFunSkill(BaseSkill):
 
     async def _token_worker(self, worker_id: int, ctx: SkillContext):
         """
-        Worker événementiel — cœur de la nouvelle architecture.
+        Worker de scoring — nouvelle architecture découplée.
 
-        Pour chaque token reçu de la queue :
-        1. Vérifier le TTL (ignorer si trop vieux)
-        2. Attendre que le MC entre dans la zone cible (polling Pump.fun)
-        3. Enrichir (holders, snipers, dev%, rugcheck)
-        4. Appliquer les filtres stricts
-        5. Scorer via Claude
-        6. Alerter si score suffisant
-
-        Plusieurs workers tournent en parallèle → pas de blocage.
+        Pioche dans _score_queue les tokens déjà dans la zone MC,
+        puis enrichit, filtre et score. Plus de polling bloquant.
+        Le polling est géré par _poll_dispatcher (tâche unique partagée).
         """
         self._context = ctx
-        logger.info("Worker #%d démarré — en attente de tokens sur la queue", worker_id)
-        _worker_loop_count = 0
+        logger.info("W#%d démarré — scoring worker", worker_id)
 
         while self._running:
             try:
-                # Attendre un token avec timeout pour pouvoir checker _running
                 try:
-                    token = await asyncio.wait_for(self._token_queue.get(), timeout=5.0)
+                    token_data = await asyncio.wait_for(self._score_queue.get(), timeout=5.0)
                 except asyncio.TimeoutError:
-                    _worker_loop_count += 1
-                    if _worker_loop_count % 12 == 0:  # log toutes les minutes
-                        logger.info("W#%d alive | queue=%d | reçus=%d traités=%d",
-                                    worker_id, self._token_queue.qsize(),
-                                    self._stats_received, self._stats_processed)
                     continue
 
-                mint   = token.get("address", "")
-                symbol = token.get("symbol", "?")
-                logger.info("W#%d ← token dépilé: %s (%s) | queue restante=%d",
-                            worker_id, symbol, mint[:8], self._token_queue.qsize())
-
-                # ── 1. Vérifier TTL ──────────────────────────────
-                age = time.time() - token.get("_queued_at", time.time())
-                if age > self._ws_buffer_ttl:
-                    logger.debug("W#%d TTL expiré %s (%.0fs)", worker_id, mint[:8], age)
-                    self._token_queue.task_done()
-                    continue
-
-                # Déduplication inter-workers
-                if mint in self._seen_tokens:
-                    self._token_queue.task_done()
-                    continue
-                # Marquer immédiatement pour éviter double-traitement par autre worker
-                self._seen_tokens.add(mint)
-
-                logger.info("W#%d → %s (%s) $%.0f | queue=%d",
-                            worker_id, symbol, mint[:8],
-                            token.get("market_cap", 0), self._token_queue.qsize())
-
-                # ── Pré-filtre rapide : si le MC initial est très bas
-                # ET qu'on a déjà beaucoup de tokens en queue, on drop
-                # Pour éviter que la queue sature sur des tokens "morts"
-                mc_initial = float(token.get("market_cap", 0) or 0)
-                queue_pressure = self._token_queue.qsize()
-                # Si queue > 50 et MC < 10% de mc_min → skip sans poll
-                if queue_pressure > 30 and mc_initial < self.mc_min * 0.15:
-                    logger.info("W#%d SKIP queue saturée (%d) + MC trop bas $%.0f: %s",
-                                worker_id, queue_pressure, mc_initial, symbol)
-                    self._token_queue.task_done()
-                    continue
-
-                # ── 2. Polling MC — attendre la zone cible ────────
-                token_data = await self._poll_until_mc_zone(token, worker_id)
-
-                if token_data is None:
-                    # N'est jamais entré dans la zone ou TTL dépassé
-                    logger.debug("W#%d %s n'a pas atteint la zone MC en temps voulu", worker_id, mint[:8])
-                    self._token_queue.task_done()
-                    continue
+                mint   = token_data.get("address", "")
+                symbol = token_data.get("symbol", "?")
 
                 self._stats_processed += 1
 
@@ -881,18 +837,165 @@ class PumpFunSkill(BaseSkill):
                     self._stats_alerted += 1
                     await self._send_alert(enriched, result)
 
-                self._token_queue.task_done()
+                self._score_queue.task_done()
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error("W#%d erreur: %s", worker_id, e)
                 try:
-                    self._token_queue.task_done()
+                    self._score_queue.task_done()
                 except Exception:
                     pass
 
         logger.info("Worker #%d arrêté", worker_id)
+
+    async def _poll_dispatcher(self, ctx: SkillContext):
+        """
+        Tâche unique de polling MC — remplace le modèle 1-worker-1-token.
+
+        Toutes les PUMP_MC_POLL secondes :
+        - Dépile les tokens de _token_queue → _pending_polls
+        - Poll le MC de TOUS les tokens en attente en parallèle
+        - Ceux qui entrent dans la zone MC → poussés dans _score_queue
+        - Ceux qui expirent (TTL) ou stagnent → supprimés
+
+        Avantage : 1 seule tâche gère N tokens simultanément,
+        le nombre de workers ne limite plus le débit de détection.
+        """
+        logger.info("Poll dispatcher démarré")
+        while self._running:
+            try:
+                # Absorber tous les tokens disponibles dans _token_queue
+                while not self._token_queue.empty():
+                    try:
+                        token = self._token_queue.get_nowait()
+                        mint  = token.get("address", "")
+                        if not mint or mint in self._seen_tokens or mint in self._pending_polls:
+                            self._token_queue.task_done()
+                            continue
+                        age = time.time() - token.get("_queued_at", time.time())
+                        if age > self._ws_buffer_ttl:
+                            self._token_queue.task_done()
+                            continue
+                        self._seen_tokens.add(mint)
+                        self._pending_polls[mint] = token
+                        self._token_queue.task_done()
+                    except asyncio.QueueEmpty:
+                        break
+
+                if not self._pending_polls:
+                    await asyncio.sleep(self._mc_poll_interval)
+                    continue
+
+                # Purger les tokens expirés (TTL)
+                now = time.time()
+                expired = [
+                    addr for addr, tok in self._pending_polls.items()
+                    if now - tok.get("_queued_at", now) > self._ws_buffer_ttl
+                ]
+                for addr in expired:
+                    del self._pending_polls[addr]
+                    logger.debug("Dispatcher TTL expiré: %s", addr[:8])
+
+                # Poll MC en parallèle sur tous les tokens en attente
+                addrs = list(self._pending_polls.keys())
+                logger.info("Dispatcher: %d tokens en poll | score_q=%d",
+                            len(addrs), self._score_queue.qsize())
+
+                async def _check_one(addr):
+                    token = self._pending_polls.get(addr)
+                    if not token:
+                        return
+                    try:
+                        pf = await self._fetch_pumpfun_coin(addr)
+                        if not pf:
+                            return
+                        mc_usd = float(pf.get("usd_market_cap", 0) or 0)
+                        token["market_cap"] = mc_usd
+                        symbol = token.get("symbol", "?")
+
+                        if mc_usd > self.mc_max * 2:
+                            # Déjà trop haut, drop
+                            del self._pending_polls[addr]
+                            logger.info("Dispatcher ABANDON trop haut: %s $%.0f", symbol, mc_usd)
+                            return
+
+                        # Abandon stagnation : MC < 30% de mc_min après plusieurs polls
+                        polls_done = token.get("_poll_count", 0) + 1
+                        token["_poll_count"] = polls_done
+                        self._pending_polls[addr] = token
+                        if polls_done >= self._mc_poll_max and mc_usd < self.mc_min * 0.30:
+                            del self._pending_polls[addr]
+                            logger.info("Dispatcher ABANDON stagnation: %s $%.0f", symbol, mc_usd)
+                            return
+
+                        if self.mc_min <= mc_usd <= self.mc_max:
+                            # Zone atteinte → enrichissement rapide et push vers scoring
+                            sol_px  = await self._get_sol_price()
+                            ws_vol  = self._vol_tracker.get(addr, 0)
+                            moralis = await self._fetch_moralis_data(addr)
+                            moralis_vol     = moralis.get("volume_24h", 0)
+                            moralis_holders = moralis.get("holders", 0)
+                            moralis_liq     = moralis.get("liquidity", 0)
+                            best_vol        = moralis_vol if moralis_vol > 0 else ws_vol
+                            if moralis_holders > 0:
+                                pf["holder_count"] = moralis_holders
+                            if moralis_liq > 0:
+                                token["liquidity"] = moralis_liq
+                            elapsed_s = time.time() - token.get("_queued_at", time.time())
+                            token.update({
+                                "holders":           int(pf.get("holder_count", 0) or 0),
+                                "snipers":           int(pf.get("sniper_count", pf.get("bot_holder_count", 0)) or 0),
+                                "dev_holding_pct":   float(pf.get("creator_percentage", 0) or 0),
+                                "top10_pct":         float(pf.get("top10_pct", 0) or 0),
+                                "reply_count":       int(pf.get("reply_count", 0) or 0),
+                                "bonding_curve_pct": float(pf.get("bonding_curve_percentage", 0) or 0),
+                                "description":       pf.get("description", token.get("description", "")),
+                                "twitter":           pf.get("twitter", ""),
+                                "telegram":          pf.get("telegram", ""),
+                                "website":           pf.get("website", ""),
+                                "volume_24h":        best_vol,
+                                "real_sol_reserves": float(pf.get("real_sol_reserves", 0) or 0),
+                                "_source":           "poll_dispatcher",
+                            })
+                            logger.info("Dispatcher ZONE ATTEINTE: %s $%.0f après %d polls (%.0fs)",
+                                        symbol, mc_usd, polls_done, elapsed_s)
+                            if self.notify_mc_zone:
+                                bc_pct    = float(pf.get("bonding_curve_percentage", 0) or 0)
+                                age_str   = self._fmt_duration(int(elapsed_s))
+                                await self._notify(
+                                    "👀 **Zone MC** — `%s`\n"
+                                    "💰 MC: **$%s** | Holders: %d | BC: %.0f%%\n"
+                                    "⏱ %s après création\n"
+                                    "🔍 Analyse en cours...\n"
+                                    "`%s`" % (
+                                        symbol,
+                                        self._fmt_k(mc_usd),
+                                        int(pf.get("holder_count", 0) or 0),
+                                        bc_pct, age_str, addr,
+                                    )
+                                )
+                            del self._pending_polls[addr]
+                            try:
+                                self._score_queue.put_nowait(token)
+                            except asyncio.QueueFull:
+                                logger.warning("Dispatcher: score_queue pleine, token %s droppé", symbol)
+
+                    except Exception as e:
+                        logger.debug("Dispatcher check %s: %s", addr[:8], e)
+
+                # Lancer tous les checks en parallèle
+                await asyncio.gather(*[_check_one(addr) for addr in addrs], return_exceptions=True)
+                await asyncio.sleep(self._mc_poll_interval)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Erreur poll dispatcher: %s", e)
+                await asyncio.sleep(5)
+
+        logger.info("Poll dispatcher arrêté")
 
     async def _poll_until_mc_zone(self, token: dict, worker_id: int) -> Optional[dict]:
         """

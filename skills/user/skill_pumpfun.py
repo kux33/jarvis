@@ -163,6 +163,7 @@ class PumpFunSkill(BaseSkill):
         self._context         = None
         self._send_callback   = None
         self._notify_user_id: int = 0   # user_id stocké au /pumpstart pour alertes proactives
+        self._trade_lock = asyncio.Lock()  # évite la race condition sur les trades simultanés
 
         # Données
         self._alerts_log: list   = []       # Toutes les alertes envoyées
@@ -2109,6 +2110,33 @@ Volume vs MC, bonding curve progression, replies récents.
     #   MOTEUR DE TRADING AUTOMATIQUE
     # ══════════════════════════════════════════════════════════════
 
+    async def _get_wallet_sol_balance(self) -> float:
+        """
+        Récupère le solde SOL du wallet via RPC Solana.
+        Retourne le solde en SOL (float), ou 0.0 si erreur.
+        """
+        public_key = self._get_public_key()
+        if not public_key:
+            return 0.0
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    self.solana_rpc,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id":      1,
+                        "method":  "getBalance",
+                        "params":  [public_key, {"commitment": "confirmed"}],
+                    },
+                    timeout=aiohttp.ClientTimeout(total=8),
+                ) as r:
+                    data = await r.json()
+                    lamports = data.get("result", {}).get("value", 0)
+                    return lamports / 1_000_000_000  # lamports → SOL
+        except Exception as e:
+            logger.debug("get_wallet_sol_balance: %s", e)
+            return 0.0
+
     async def _auto_trade(self, token_data: dict, score_result: dict):
         """
         Décide et exécute automatiquement un trade selon le score.
@@ -2122,157 +2150,190 @@ Volume vs MC, bonding curve progression, replies récents.
         addr     = token_data.get("address", "")
         symbol   = token_data.get("symbol", "?")
 
-        # Vérifier si déjà en position
-        if addr in self._positions:
-            logger.debug("Auto-trade ignoré: déjà en position sur %s", symbol)
-            return
-
-        # Vérifier score minimum
+        # Vérifier score minimum (hors lock, pas de side-effect)
         if score < self.buy_score_min:
             logger.debug("Auto-trade ignoré: score %d < %d pour %s", score, self.buy_score_min, symbol)
             return
 
-        # Vérifier limite positions simultanées
-        if len(self._positions) >= self.max_open_trades:
-            logger.warning("Auto-trade bloqué: max positions (%d) atteint", self.max_open_trades)
-            await self._notify(
-                "⚠️ **Auto-trade bloqué** : %d/%d positions déjà ouvertes\n"
-                "Token ignoré : **%s** (score %d/100)\n"
-                "Ferme une position avec `/pumpclose`"
-                % (len(self._positions), self.max_open_trades, symbol, score)
-            )
-            return
+        # ── LOCK : toute la logique de décision + enregistrement est atomique ──
+        # Empêche la race condition quand plusieurs workers scorent simultanément
+        async with self._trade_lock:
 
-        # Vérifier perte journalière max
-        self._check_daily_reset()
-        if self._daily_pnl <= -self.max_daily_loss:
-            logger.warning("Auto-trade bloqué: perte journalière max $%.2f atteinte", self.max_daily_loss)
-            await self._notify(
-                "🛑 **Trading pausé : perte journalière max atteinte**\n"
-                "Perte aujourd'hui: $%.2f / limite $%.2f\n"
-                "Trading reprendra demain automatiquement."
-                % (self._daily_pnl, self.max_daily_loss)
-            )
-            return
-
-        # Déterminer conviction et mise
-        conviction = "high" if score >= self.buy_score_high else "normal"
-        amount_usd = self.buy_amount_high if conviction == "high" else self.buy_amount
-
-        # Récupérer le prix d'entrée
-        entry_price = await self._get_token_price(addr)
-        if entry_price <= 0:
-            # Fallback sur MC / supply approximative
-            mc = token_data.get("market_cap", 0)
-            entry_price = mc / 1_000_000_000 if mc > 0 else 0  # Estimation
-        if entry_price <= 0:
-            logger.warning("Prix introuvable pour %s, trade annulé", symbol)
-            return
-
-        shares    = amount_usd / entry_price
-        sl_price  = entry_price * (1 - self.sl)
-
-        # ── PAPER MODE ────────────────────────────────────────
-        if self.trade_mode == "paper":
-            self._positions[addr] = {
-                "symbol":       symbol,
-                "name":         token_data.get("name", "?"),
-                "entry_price":  entry_price,
-                "amount_usd":   amount_usd,
-                "shares":       shares,
-                "sl_price":     sl_price,
-                "opened_at":    datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "timestamp":    int(time.time()),
-                "score":        score,
-                "conviction":   conviction,
-                "tp1_hit":      False,
-                "tp2_hit":      False,
-                "tp3_hit":      False,
-                "paper":        True,
-                "tp1_price":    entry_price * self.tp1,
-                "tp2_price":    entry_price * self.tp2,
-                "tp3_price":    entry_price * self.tp3,
-                "remaining_shares": shares,
-            }
-            self._save_state()
-            logger.info(
-                "PAPER BUY %s: $%.2f @ $%.6f | SL: $%.6f | Score: %d/100",
-                symbol, amount_usd, entry_price, sl_price, score
-            )
-            conv_badge = "🔴 HIGH CONVICTION" if conviction == "high" else "🟡 Normal"
-            await self._notify(
-                "📄 **AUTO-TRADE PAPER — BUY**\n"
-                "━━━━━━━━━━━━━━━\n"
-                "🪙 **%s** | Score: **%d/100** | %s\n"
-                "💰 Mise: **$%.2f** @ `$%.6f`\n"
-                "📈 TP1: $%.6f (x%.1f) | TP2: $%.6f (x%.1f) | TP3: $%.6f (x%.1f)\n"
-                "🛡 SL: $%.6f (-%.0f%%)\n"
-                "🔗 https://pump.fun/%s"
-                % (
-                    symbol, score, conv_badge,
-                    amount_usd, entry_price,
-                    entry_price * self.tp1, self.tp1,
-                    entry_price * self.tp2, self.tp2,
-                    entry_price * self.tp3, self.tp3,
-                    sl_price, self.sl * 100,
-                    addr,
-                )
-            )
-
-        # ── LIVE MODE ─────────────────────────────────────────
-        elif self.trade_mode == "live":
-            if not self.wallet_key:
-                await self._notify("❌ LIVE trade impossible : PUMP_WALLET_KEY manquant")
+            # Vérifier si déjà en position (re-check sous lock)
+            if addr in self._positions:
+                logger.debug("Auto-trade ignoré: déjà en position sur %s", symbol)
                 return
 
-            tx_hash = await self._execute_live_buy(addr, amount_usd, entry_price)
-            if not tx_hash:
+            # Vérifier limite positions simultanées (sous lock = valeur exacte)
+            if len(self._positions) >= self.max_open_trades:
+                logger.warning("Auto-trade bloqué: max positions (%d) atteint", self.max_open_trades)
                 await self._notify(
-                    "❌ **AUTO-TRADE LIVE ÉCHOUÉ**\n"
-                    "Token: **%s** | Tentative: $%.2f\n"
-                    "Vérifie les logs pour détails." % (symbol, amount_usd)
+                    "⚠️ **Auto-trade bloqué** : %d/%d positions déjà ouvertes\n"
+                    "Token ignoré : **%s** (score %d/100)\n"
+                    "Ferme une position avec `/pumpclose`"
+                    % (len(self._positions), self.max_open_trades, symbol, score)
                 )
                 return
 
-            # Enregistrer la position
-            self._positions[addr] = {
-                "symbol":       symbol,
-                "name":         token_data.get("name", "?"),
-                "entry_price":  entry_price,
-                "amount_usd":   amount_usd,
-                "shares":       shares,
-                "sl_price":     sl_price,
-                "opened_at":    datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "timestamp":    int(time.time()),
-                "score":        score,
-                "conviction":   conviction,
-                "tp1_hit":      False,
-                "tp2_hit":      False,
-                "tp3_hit":      False,
-                "paper":        False,
-                "tx_hash_buy":  tx_hash,
-                "tp1_price":    entry_price * self.tp1,
-                "tp2_price":    entry_price * self.tp2,
-                "tp3_price":    entry_price * self.tp3,
-                "remaining_shares": shares,
-            }
-            self._save_state()
-            conv_badge = "🔴 HIGH CONVICTION" if conviction == "high" else "🟡 Normal"
-            await self._notify(
-                "💸 **AUTO-TRADE LIVE — BUY EXÉCUTÉ**\n"
-                "━━━━━━━━━━━━━━━\n"
-                "🪙 **%s** | Score: **%d/100** | %s\n"
-                "💰 Mise: **$%.2f** @ `$%.6f`\n"
-                "📈 TP1: x%.1f | TP2: x%.1f | TP3: x%.1f | SL: -%.0f%%\n"
-                "🔗 TX: `%s`"
-                % (
-                    symbol, score, conv_badge,
-                    amount_usd, entry_price,
-                    self.tp1, self.tp2, self.tp3, self.sl * 100,
-                    tx_hash[:20] + "...",
+            # Vérifier perte journalière max
+            self._check_daily_reset()
+            if self._daily_pnl <= -self.max_daily_loss:
+                logger.warning("Auto-trade bloqué: perte journalière max $%.2f atteinte", self.max_daily_loss)
+                await self._notify(
+                    "🛑 **Trading pausé : perte journalière max atteinte**\n"
+                    "Perte aujourd'hui: $%.2f / limite $%.2f\n"
+                    "Trading reprendra demain automatiquement."
+                    % (self._daily_pnl, self.max_daily_loss)
                 )
-            )
+                return
 
+            # Déterminer conviction et mise
+            conviction = "high" if score >= self.buy_score_high else "normal"
+            amount_usd = self.buy_amount_high if conviction == "high" else self.buy_amount
+
+            # ── Vérification solde SOL (mode live uniquement) ──────────────
+            if self.trade_mode == "live":
+                sol_price   = await self._get_sol_price()
+                sol_needed  = (amount_usd / sol_price) if sol_price > 0 else 999
+                # Réserver 0.05 SOL pour les fees (priority fee + rent)
+                SOL_FEE_RESERVE = 0.05
+                # Capital total engagé dans les positions ouvertes
+                sol_engaged = sum(
+                    p.get("amount_usd", 0) / sol_price
+                    for p in self._positions.values()
+                ) if sol_price > 0 else 0
+
+                sol_balance = await self._get_wallet_sol_balance()
+                sol_libre   = sol_balance - sol_engaged - SOL_FEE_RESERVE
+
+                if sol_libre < sol_needed:
+                    logger.warning(
+                        "Auto-trade bloqué: solde insuffisant %.4f SOL libre < %.4f SOL requis",
+                        sol_libre, sol_needed
+                    )
+                    await self._notify(
+                        "⚠️ **Trade bloqué : solde insuffisant**\n"
+                        "🪙 **%s** (score %d/100)\n"
+                        "💰 SOL libre: **%.4f** | Requis: **%.4f** SOL\n"
+                        "📊 Balance: %.4f SOL | Engagé: %.4f SOL | Réserve fees: %.3f SOL"
+                        % (symbol, score, sol_libre, sol_needed,
+                           sol_balance, sol_engaged, SOL_FEE_RESERVE)
+                    )
+                    return
+
+            # Récupérer le prix d'entrée (toujours sous lock)
+            entry_price = await self._get_token_price(addr)
+            if entry_price <= 0:
+                mc = token_data.get("market_cap", 0)
+                entry_price = mc / 1_000_000_000 if mc > 0 else 0
+            if entry_price <= 0:
+                logger.warning("Prix introuvable pour %s, trade annulé", symbol)
+                return
+
+            shares    = amount_usd / entry_price
+            sl_price  = entry_price * (1 - self.sl)
+
+            # ── PAPER MODE ────────────────────────────────────────
+            # ── PAPER MODE ────────────────────────────────────────
+            if self.trade_mode == "paper":
+                self._positions[addr] = {
+                    "symbol":       symbol,
+                    "name":         token_data.get("name", "?"),
+                    "entry_price":  entry_price,
+                    "amount_usd":   amount_usd,
+                    "shares":       shares,
+                    "sl_price":     sl_price,
+                    "opened_at":    datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "timestamp":    int(time.time()),
+                    "score":        score,
+                    "conviction":   conviction,
+                    "tp1_hit":      False,
+                    "tp2_hit":      False,
+                    "tp3_hit":      False,
+                    "paper":        True,
+                    "tp1_price":    entry_price * self.tp1,
+                    "tp2_price":    entry_price * self.tp2,
+                    "tp3_price":    entry_price * self.tp3,
+                    "remaining_shares": shares,
+                }
+                self._save_state()
+                logger.info(
+                    "PAPER BUY %s: $%.2f @ $%.6f | SL: $%.6f | Score: %d/100",
+                    symbol, amount_usd, entry_price, sl_price, score
+                )
+                conv_badge = "🔴 HIGH CONVICTION" if conviction == "high" else "🟡 Normal"
+                await self._notify(
+                    "📄 **AUTO-TRADE PAPER — BUY**\n"
+                    "━━━━━━━━━━━━━━━\n"
+                    "🪙 **%s** | Score: **%d/100** | %s\n"
+                    "💰 Mise: **$%.2f** @ `$%.6f`\n"
+                    "📈 TP1: $%.6f (x%.1f) | TP2: $%.6f (x%.1f) | TP3: $%.6f (x%.1f)\n"
+                    "🛡 SL: $%.6f (-%.0f%%)\n"
+                    "🔗 https://pump.fun/%s"
+                    % (
+                        symbol, score, conv_badge,
+                        amount_usd, entry_price,
+                        entry_price * self.tp1, self.tp1,
+                        entry_price * self.tp2, self.tp2,
+                        entry_price * self.tp3, self.tp3,
+                        sl_price, self.sl * 100,
+                        addr,
+                    )
+                )
+
+            # ── LIVE MODE ─────────────────────────────────────────
+            elif self.trade_mode == "live":
+                if not self.wallet_key:
+                    await self._notify("❌ LIVE trade impossible : PUMP_WALLET_KEY manquant")
+                    return
+
+                tx_hash = await self._execute_live_buy(addr, amount_usd, entry_price)
+                if not tx_hash:
+                    await self._notify(
+                        "❌ **AUTO-TRADE LIVE ÉCHOUÉ**\n"
+                        "Token: **%s** | Tentative: $%.2f\n"
+                        "Vérifie les logs pour détails." % (symbol, amount_usd)
+                    )
+                    return
+
+                # Enregistrer la position
+                self._positions[addr] = {
+                    "symbol":       symbol,
+                    "name":         token_data.get("name", "?"),
+                    "entry_price":  entry_price,
+                    "amount_usd":   amount_usd,
+                    "shares":       shares,
+                    "sl_price":     sl_price,
+                    "opened_at":    datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "timestamp":    int(time.time()),
+                    "score":        score,
+                    "conviction":   conviction,
+                    "tp1_hit":      False,
+                    "tp2_hit":      False,
+                    "tp3_hit":      False,
+                    "paper":        False,
+                    "tx_hash_buy":  tx_hash,
+                    "tp1_price":    entry_price * self.tp1,
+                    "tp2_price":    entry_price * self.tp2,
+                    "tp3_price":    entry_price * self.tp3,
+                    "remaining_shares": shares,
+                }
+                self._save_state()
+                conv_badge = "🔴 HIGH CONVICTION" if conviction == "high" else "🟡 Normal"
+                await self._notify(
+                    "💸 **AUTO-TRADE LIVE — BUY EXÉCUTÉ**\n"
+                    "━━━━━━━━━━━━━━━\n"
+                    "🪙 **%s** | Score: **%d/100** | %s\n"
+                    "💰 Mise: **$%.2f** @ `$%.6f`\n"
+                    "📈 TP1: x%.1f | TP2: x%.1f | TP3: x%.1f | SL: -%.0f%%\n"
+                    "🔗 TX: `%s`"
+                    % (
+                        symbol, score, conv_badge,
+                        amount_usd, entry_price,
+                        self.tp1, self.tp2, self.tp3, self.sl * 100,
+                        tx_hash[:20] + "...",
+                    )
+                )
     async def _sync_ws_subscriptions(self):
         """
         S'assure que toutes les positions ouvertes sont souscrites via WS

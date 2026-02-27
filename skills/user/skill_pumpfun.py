@@ -1831,6 +1831,17 @@ Volume vs MC, bonding curve progression, replies récents.
                 % (current, mode_desc["paper"], mode_desc["live"], mode_desc["off"])
             )
 
+        if mode == "live":
+            # Vérifier que solders est installé avant d'activer le mode live
+            try:
+                from solders.keypair import Keypair
+                from solders.transaction import VersionedTransaction
+            except ImportError:
+                return (
+                    "❌ **Mode LIVE impossible**\n"
+                    "Installe les dépendances Solana d'abord :\n"
+                    "`pip install solders base58 --break-system-packages`"
+                )
         if mode == "live" and not self.wallet_key:
             return (
                 "❌ **Mode LIVE impossible sans wallet configuré**\n\n"
@@ -2586,169 +2597,155 @@ Volume vs MC, bonding curve progression, replies récents.
 
     async def _execute_live_buy(self, addr: str, amount_usd: float, price: float) -> Optional[str]:
         """
-        Exécute un achat réel sur Pump.fun via Jupiter Aggregator ou Pump.fun API.
-        Retourne le tx_hash ou None si échec.
+        Exécute un achat réel via PumpPortal Trade API (SOL → token sur bonding curve).
 
-        ⚠️  IMPORTANT : Cette fonction requiert PUMP_WALLET_KEY configuré.
-        Elle construit et signe une transaction Solana.
+        PumpPortal construit la transaction correctement pour la bonding curve Pump.fun.
+        On signe localement avec la clé privée et on envoie au RPC Solana.
+
+        Dépendances : pip install solders base58
         """
         if not self.wallet_key:
             logger.error("LIVE BUY impossible: PUMP_WALLET_KEY non configuré")
             return None
 
-        logger.info(
-            "LIVE BUY %s: $%.2f @ $%.6f",
-            addr[:16], amount_usd, price
-        )
+        sol_price  = await self._get_sol_price()
+        sol_amount = amount_usd / sol_price if sol_price > 0 else 0
+        if sol_amount <= 0:
+            logger.error("LIVE BUY: prix SOL introuvable")
+            return None
 
-        # ── Tentative via Jupiter API (swap USDC → token) ────
+        public_key = self._get_public_key()
+        if not public_key:
+            return None
+
+        logger.info("LIVE BUY %s: $%.2f = %.4f SOL @ SOL=$%.0f",
+                    addr[:16], amount_usd, sol_amount, sol_price)
+
         try:
-            # Convertir USD en lamports USDC (6 decimals)
-            USDC_MINT    = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-            usdc_amount  = int(amount_usd * 1_000_000)  # 6 decimals
-
             async with aiohttp.ClientSession() as session:
-                # 1. Obtenir le quote Jupiter
-                async with session.get(
-                    "https://quote-api.jup.ag/v6/quote",
-                    params={
-                        "inputMint":  USDC_MINT,
-                        "outputMint": addr,
-                        "amount":     usdc_amount,
-                        "slippageBps": 500,  # 5% slippage max
-                    },
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as r:
-                    if r.status != 200:
-                        logger.warning("Jupiter quote failed: %d", r.status)
-                        return None
-                    quote = await r.json()
-
-                # 2. Construire la transaction
                 async with session.post(
-                    "https://quote-api.jup.ag/v6/swap",
+                    "https://pumpportal.fun/api/trade-local",
                     json={
-                        "quoteResponse":        quote,
-                        "userPublicKey":        self._get_public_key(),
-                        "wrapAndUnwrapSol":     True,
-                        "computeUnitPriceMicroLamports": 100000,
+                        "publicKey":        public_key,
+                        "action":           "buy",
+                        "mint":             addr,
+                        "amount":           round(sol_amount, 6),
+                        "denominatedInSol": "true",
+                        "slippage":         10,           # 10% slippage — memecoins volatils
+                        "priorityFee":      0.001,        # 0.001 SOL priority fee pour rapidité
+                        "pool":             "pump",       # forcer bonding curve pump.fun
                     },
-                    timeout=aiohttp.ClientTimeout(total=10),
+                    timeout=aiohttp.ClientTimeout(total=15),
                 ) as r:
                     if r.status != 200:
-                        logger.warning("Jupiter swap build failed: %d", r.status)
+                        body = await r.text()
+                        logger.error("PumpPortal BUY HTTP %d: %s", r.status, body[:200])
                         return None
-                    swap_data   = await r.json()
-                    swap_tx_b64 = swap_data.get("swapTransaction", "")
+                    tx_bytes = await r.read()   # réponse = tx sérialisée en bytes
 
-                # 3. Signer et envoyer via RPC Solana
-                tx_hash = await self._sign_and_send_transaction(swap_tx_b64)
-                if tx_hash:
-                    logger.info("LIVE BUY OK: tx=%s", tx_hash[:20])
-                    return tx_hash
+            tx_hash = await self._sign_and_send_transaction(tx_bytes)
+            if tx_hash:
+                logger.info("LIVE BUY OK: tx=%s", tx_hash[:20])
+            return tx_hash
 
         except Exception as e:
             logger.error("Live buy error %s: %s", addr[:16], e)
-
-        return None
+            return None
 
     async def _execute_live_sell(self, addr: str, shares: float, price: float) -> Optional[str]:
         """
-        Exécute une vente réelle sur Jupiter.
-        Retourne le tx_hash ou None.
+        Exécute une vente réelle via PumpPortal Trade API (token → SOL sur bonding curve).
+        `shares` est le nombre de tokens à vendre (avec 6 decimals Pump.fun).
         """
         if not self.wallet_key:
             logger.error("LIVE SELL impossible: PUMP_WALLET_KEY non configuré")
             return None
 
-        logger.info("LIVE SELL %s: %.4f shares @ $%.6f", addr[:16], shares, price)
+        public_key = self._get_public_key()
+        if not public_key:
+            return None
+
+        # Arrondir au nombre de tokens entiers (6 decimals pump.fun)
+        token_amount = int(shares)
+        if token_amount <= 0:
+            logger.warning("LIVE SELL: shares=%.2f → 0 tokens, annulé", shares)
+            return None
+
+        logger.info("LIVE SELL %s: %d tokens @ $%.6f", addr[:16], token_amount, price)
 
         try:
-            USDC_MINT   = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-            # Estimation du montant en plus petite unité (assume 6 decimals)
-            token_amount = int(shares * 1_000_000)
-
             async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    "https://quote-api.jup.ag/v6/quote",
-                    params={
-                        "inputMint":  addr,
-                        "outputMint": USDC_MINT,
-                        "amount":     token_amount,
-                        "slippageBps": 500,
-                    },
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as r:
-                    if r.status != 200:
-                        return None
-                    quote = await r.json()
-
                 async with session.post(
-                    "https://quote-api.jup.ag/v6/swap",
+                    "https://pumpportal.fun/api/trade-local",
                     json={
-                        "quoteResponse":  quote,
-                        "userPublicKey":  self._get_public_key(),
-                        "wrapAndUnwrapSol": True,
+                        "publicKey":        public_key,
+                        "action":           "sell",
+                        "mint":             addr,
+                        "amount":           token_amount,
+                        "denominatedInSol": "false",      # montant en tokens, pas en SOL
+                        "slippage":         10,
+                        "priorityFee":      0.001,        # priority fee aussi sur les sells
+                        "pool":             "pump",
                     },
-                    timeout=aiohttp.ClientTimeout(total=10),
+                    timeout=aiohttp.ClientTimeout(total=15),
                 ) as r:
                     if r.status != 200:
+                        body = await r.text()
+                        logger.error("PumpPortal SELL HTTP %d: %s", r.status, body[:200])
                         return None
-                    swap_data   = await r.json()
-                    swap_tx_b64 = swap_data.get("swapTransaction", "")
+                    tx_bytes = await r.read()
 
-                tx_hash = await self._sign_and_send_transaction(swap_tx_b64)
-                if tx_hash:
-                    logger.info("LIVE SELL OK: tx=%s", tx_hash[:20])
-                    return tx_hash
+            tx_hash = await self._sign_and_send_transaction(tx_bytes)
+            if tx_hash:
+                logger.info("LIVE SELL OK: tx=%s", tx_hash[:20])
+            return tx_hash
 
         except Exception as e:
             logger.error("Live sell error %s: %s", addr[:16], e)
-
-        return None
+            return None
 
     def _get_public_key(self) -> str:
-        """Dérive la clé publique depuis la clé privée"""
+        """Dérive la clé publique Solana depuis la clé privée base58."""
         try:
+            from solders.keypair import Keypair
             import base58
-            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
             key_bytes = base58.b58decode(self.wallet_key)
+            # Solana keypair = 64 bytes (privé 32 + public 32) ou 32 bytes privé seul
             if len(key_bytes) == 64:
-                key_bytes = key_bytes[:32]
-            priv = Ed25519PrivateKey.from_private_bytes(key_bytes)
-            pub  = priv.public_key().public_bytes_raw()
-            return base58.b58encode(pub).decode()
+                kp = Keypair.from_bytes(key_bytes)
+            else:
+                kp = Keypair.from_seed(key_bytes)
+            return str(kp.pubkey())
         except ImportError:
-            logger.error("base58 ou cryptography non installé. pip install base58 cryptography")
+            logger.error("solders non installé — pip install solders base58")
             return ""
         except Exception as e:
             logger.error("get_public_key: %s", e)
             return ""
 
-    async def _sign_and_send_transaction(self, tx_b64: str) -> Optional[str]:
+    async def _sign_and_send_transaction(self, tx_bytes: bytes) -> Optional[str]:
         """
-        Signe une transaction versioning Solana et l'envoie au RPC.
-        Retourne le tx_hash ou None.
+        Signe une transaction Solana sérialisée (format PumpPortal) et l'envoie au RPC.
+
+        PumpPortal renvoie une transaction déjà construite avec tous les bons comptes.
+        On la signe avec notre keypair et on l'envoie via sendTransaction.
         """
-        if not tx_b64 or not self.wallet_key:
+        if not tx_bytes or not self.wallet_key:
             return None
         try:
-            import base64, base58
-            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+            from solders.keypair import Keypair
+            from solders.transaction import VersionedTransaction
+            import base58, base64
 
-            # Décoder la transaction
-            tx_bytes  = base64.b64decode(tx_b64)
+            # Reconstruire le keypair
             key_bytes = base58.b58decode(self.wallet_key)
-            if len(key_bytes) == 64:
-                key_bytes = key_bytes[:32]
-            priv_key = Ed25519PrivateKey.from_private_bytes(key_bytes)
+            kp = Keypair.from_bytes(key_bytes) if len(key_bytes) == 64 else Keypair.from_seed(key_bytes)
 
-            # Signer le message (bytes 65+ pour versioned tx)
-            # Format simplifié — en production utiliser solana-py pour la gestion complète
-            signature  = priv_key.sign(tx_bytes)
-            signed_tx  = base64.b64encode(signature + tx_bytes).decode()
+            # Désérialiser, signer, re-sérialiser
+            tx        = VersionedTransaction.from_bytes(tx_bytes)
+            tx.sign([kp])
+            signed_b64 = base64.b64encode(bytes(tx)).decode()
 
-            # Envoyer au RPC Solana
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     self.solana_rpc,
@@ -2757,24 +2754,26 @@ Volume vs MC, bonding curve progression, replies récents.
                         "id":      1,
                         "method":  "sendTransaction",
                         "params":  [
-                            signed_tx,
-                            {"encoding": "base64", "skipPreflight": False,
-                             "preflightCommitment": "confirmed"},
+                            signed_b64,
+                            {
+                                "encoding":             "base64",
+                                "skipPreflight":        False,
+                                "preflightCommitment":  "confirmed",
+                                "maxRetries":           3,
+                            },
                         ],
                     },
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as r:
                     data = await r.json()
                     if "result" in data:
-                        return data["result"]
-                    logger.error("sendTransaction error: %s", data.get("error", data))
+                        return data["result"]   # tx signature = hash
+                    err = data.get("error", {})
+                    logger.error("sendTransaction error: %s", err)
                     return None
 
         except ImportError:
-            logger.error(
-                "Dépendances manquantes pour live trading. "
-                "Installe : pip install base58 cryptography"
-            )
+            logger.error("solders non installé — pip install solders base58")
             return None
         except Exception as e:
             logger.error("sign_and_send_transaction: %s", e)

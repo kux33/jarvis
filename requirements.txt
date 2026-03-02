@@ -1,30 +1,48 @@
-# JARVIS - Dépendances Python
+# JARVIS — Dépendances Python
 # Compatible Raspberry Pi 5 (ARM64) + Python 3.11+
+# Mise à jour : 2026-03
 
-# ──────────────────────────────
+# ──────────────────────────────────────────────────
 # LLM Providers
-# ──────────────────────────────
-anthropic>=0.30.0          # Claude
-openai>=1.35.0             # OpenAI GPT + Grok + Kimi (compatible API)
+# ──────────────────────────────────────────────────
+anthropic>=0.30.0          # Claude (scoring + agent)
+openai>=1.35.0             # OpenAI GPT / Grok / Kimi (API compatible)
 
-# ──────────────────────────────
+# ──────────────────────────────────────────────────
 # Telegram
-# ──────────────────────────────
-python-telegram-bot>=21.0
+# ──────────────────────────────────────────────────
+python-telegram-bot>=21.0  # Bot Telegram (interface principale)
 
-# ──────────────────────────────
+# ──────────────────────────────────────────────────
+# HTTP Async
+# ──────────────────────────────────────────────────
+aiohttp>=3.9.0             # Requêtes HTTP async (toutes les skills)
+websockets>=12.0           # WebSocket PumpPortal temps réel (skill_pumpfun)
+
+# ──────────────────────────────────────────────────
+# Solana / Crypto (skill_pumpfun — live trading)
+# ──────────────────────────────────────────────────
+solders>=0.21.0            # Signer les transactions Solana (VersionedTransaction)
+base58>=2.1.0              # Encoder/décoder clés Solana
+
+# ──────────────────────────────────────────────────
+# Polymarket (skill_polyjarvis + skill_copytrading)
+# ──────────────────────────────────────────────────
+py-clob-client>=0.14.0     # API Polymarket CLOB (ordres, positions)
+web3>=6.0.0                # Signature Ethereum pour Polymarket
+
+# ──────────────────────────────────────────────────
 # Système & Monitoring
-# ──────────────────────────────
+# ──────────────────────────────────────────────────
 psutil>=5.9.0              # CPU, RAM, température
 
-# ──────────────────────────────
+# ──────────────────────────────────────────────────
 # Utilitaires
-# ──────────────────────────────
-python-dotenv>=1.0.0       # Chargement .env
-aiohttp>=3.9.0             # Requêtes HTTP async (skill météo)
+# ──────────────────────────────────────────────────
+python-dotenv>=1.0.0       # Chargement fichier .env
 
-# ──────────────────────────────
-# Raspberry Pi (optionnel)
-# ──────────────────────────────
-# RPi.GPIO>=0.7.1          # GPIO (décommenter si nécessaire)
-# picamera2>=0.3.12        # Caméra (décommenter si nécessaire)
+# ──────────────────────────────────────────────────
+# Raspberry Pi — optionnel (décommenter si nécessaire)
+# ──────────────────────────────────────────────────
+# RPi.GPIO>=0.7.1          # GPIO (skill_gpio — nécessite ENABLE_GPIO=true dans .env)
+# picamera2>=0.3.12        # Caméra (si skill caméra activée)

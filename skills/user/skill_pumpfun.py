@@ -132,8 +132,8 @@ class PumpFunSkill(BaseSkill):
         self.dev_hold_max     = float(os.getenv("PUMP_DEV_HOLD_MAX",  "15"))
         self.top10_max        = float(os.getenv("PUMP_TOP10_MAX",     "20"))
         self.age_max_hours    = float(os.getenv("PUMP_AGE_MAX_HOURS", "2"))
-        self.score_alert      = int(os.getenv("PUMP_SCORE_ALERT",     "70"))
-        self.score_high       = int(os.getenv("PUMP_SCORE_HIGH",      "85"))
+        self.score_alert      = int(os.getenv("PUMP_SCORE_ALERT",     "55"))
+        self.score_high       = int(os.getenv("PUMP_SCORE_HIGH",      "70"))
         self.notify_mc_zone   = os.getenv("PUMP_NOTIFY_MC_ZONE", "true").lower() == "true"
         self.max_alerts_hour  = int(os.getenv("PUMP_MAX_ALERTS_PER_HOUR", "10"))
         self.rugcheck_enabled = os.getenv("PUMP_RUGCHECK_ENABLED", "true").lower() == "true"
@@ -164,6 +164,7 @@ class PumpFunSkill(BaseSkill):
         self._send_callback   = None
         self._notify_user_id: int = 0   # user_id stocké au /pumpstart pour alertes proactives
         self._trade_lock = asyncio.Lock()  # évite la race condition sur les trades simultanés
+        self._claude_sem  = asyncio.Semaphore(3)  # max 3 appels Claude simultanés
 
         # Données
         self._alerts_log: list   = []       # Toutes les alertes envoyées
@@ -756,65 +757,50 @@ class PumpFunSkill(BaseSkill):
 
                 mint   = token_data.get("address", "")
                 symbol = token_data.get("symbol", "?")
-
                 self._stats_processed += 1
 
-                # ── 3. Enrichissement complet ─────────────────────
+                # ── Enrichissement complet (RugCheck, age, données manquantes) ──
                 enriched = await self._enrich_token(token_data)
                 if not enriched:
-                    self._token_queue.task_done()
+                    self._score_queue.task_done()
                     continue
 
-                # ── 4. Filtres stricts ────────────────────────────
+                # ── Filtres stricts ────────────────────────────────
                 ok, reason = self._apply_filters(enriched)
-
                 if ok is None:
-                    # Rejet temporaire (volume insuffisant) — requeue dans 60s
-                    retry_count = enriched.get("_retry_count", 0) + 1
-                    max_retries = 4  # max 4 retries = 4min supplémentaires
-                    age_total   = time.time() - enriched.get("_queued_at", time.time())
-
-                    if retry_count <= max_retries and age_total < self._ws_buffer_ttl:
-                        enriched["_retry_count"] = retry_count
-                        enriched["_retry_after"] = time.time() + 60
-                        # Retirer de _seen_tokens pour permettre le retraitement
+                    # Volume insuffisant — repasser dans pending_polls si token frais
+                    age_total = time.time() - enriched.get("_queued_at", time.time())
+                    if age_total < self._ws_buffer_ttl:
+                        self._pending_polls[mint] = enriched
                         self._seen_tokens.discard(mint)
-                        logger.info("W#%d RETRY %d/%d dans 60s: %s — %s",
-                                    worker_id, retry_count, max_retries, symbol, reason)
-                        await asyncio.sleep(60)
-                        try:
-                            self._token_queue.put_nowait(enriched)
-                        except asyncio.QueueFull:
-                            logger.warning("W#%d RETRY drop (queue pleine): %s", worker_id, symbol)
+                        logger.info("W#%d RETRY dispatcher: %s — %s", worker_id, symbol, reason)
                     else:
-                        logger.info("W#%d filtre définitif (max retries/TTL): %s — %s",
-                                    worker_id, symbol, reason)
-                    self._token_queue.task_done()
+                        logger.info("W#%d filtre TTL: %s — %s", worker_id, symbol, reason)
+                    self._score_queue.task_done()
                     continue
 
                 if not ok:
                     logger.info("W#%d filtre: %s — %s", worker_id, symbol, reason)
-                    self._token_queue.task_done()
+                    self._score_queue.task_done()
                     continue
 
                 self._stats_filtered += 1
-                logger.info("W#%d ✅ CANDIDAT: %s $%.0f %dh %ds",
+                logger.info("W#%d ✅ CANDIDAT: %s $%.0f h=%d",
                             worker_id, symbol,
                             enriched.get("market_cap", 0),
-                            enriched.get("holders", 0),
-                            enriched.get("snipers", 0))
+                            enriched.get("holders", 0))
 
-                # ── 5. Scoring Claude ─────────────────────────────
+                # ── Scoring Claude ─────────────────────────────────
                 result = await self._score_with_claude(enriched)
                 score  = result.get("score", 0)
                 self._stats_scored += 1
 
-                # Enregistrer dans scan_log (format compatible)
+                # ── Scan log ───────────────────────────────────────
                 self._scan_count += 1
                 self._scan_log.append({
                     "num":        self._scan_count,
                     "ts":         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "elapsed_s":  round(time.time() - token.get("_queued_at", time.time()), 1),
+                    "elapsed_s":  round(time.time() - token_data.get("_queued_at", time.time()), 1),
                     "buf_tokens": 1,
                     "candidates": 1,
                     "scored":     [{
@@ -832,8 +818,9 @@ class PumpFunSkill(BaseSkill):
                 })
                 if len(self._scan_log) > 200:
                     self._scan_log = self._scan_log[-200:]
+                self._save_state()
 
-                # ── 6. Alerte ─────────────────────────────────────
+                # ── Alerte ─────────────────────────────────────────
                 if score >= self.score_alert:
                     self._stats_alerted += 1
                     await self._send_alert(enriched, result)
@@ -843,7 +830,7 @@ class PumpFunSkill(BaseSkill):
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("W#%d erreur: %s", worker_id, e)
+                logger.error("W#%d erreur inattendue: %s", worker_id, e, exc_info=True)
                 try:
                     self._score_queue.task_done()
                 except Exception:
@@ -1502,6 +1489,45 @@ class PumpFunSkill(BaseSkill):
     #   SCORING CLAUDE
     # ══════════════════════════════════════════════════════════════
 
+    def _parse_claude_json(self, text: str) -> Optional[dict]:
+        """
+        Parse le JSON retourné par Claude de manière robuste.
+        Résistant aux textes parasites, blocs markdown, commentaires.
+        Cherche le premier { jusqu'au dernier } correspondant.
+        """
+        if not text:
+            return None
+        # Retirer les blocs markdown ```json ... ```
+        clean = text.strip()
+        if "```" in clean:
+            import re
+            clean = re.sub(r"```(?:json)?", "", clean).replace("```", "").strip()
+        # Trouver le premier { et extraire jusqu'au } correspondant
+        start = clean.find("{")
+        if start == -1:
+            return None
+        depth = 0
+        end   = -1
+        for i, c in enumerate(clean[start:], start):
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        if end == -1:
+            return None
+        try:
+            result = json.loads(clean[start:end])
+            # Valider les champs essentiels
+            if "score" not in result:
+                return None
+            result["score"] = max(0, min(100, int(result["score"])))
+            return result
+        except (json.JSONDecodeError, ValueError):
+            return None
+
     async def _score_with_claude(self, t: dict) -> dict:
         """
         Envoie les données du token à Claude pour analyse et scoring 0-100.
@@ -1543,15 +1569,21 @@ class PumpFunSkill(BaseSkill):
         rug_score_str = str(raw_rug_score)       if raw_rug_score not in (None, "N/A") else "non récupéré (API timeout — traiter en NEUTRE)"
         rug_risks_str = ", ".join(raw_rug_risks) if raw_rug_risks else "aucun détecté"
 
-        # Les liens sociaux absents = vrai red flag (le token n'a tout simplement pas de socials)
+        # Les liens sociaux absents : red flag UNIQUEMENT si token > 20min
+        # Avant 20min : normal de ne pas encore avoir posté ses socials
         has_socials = bool(twitter or telegram or website)
-        socials_str = (
-            f"Twitter={twitter or 'non'} | TG={telegram or 'non'} | Site={website or 'non'}"
-            if has_socials
-            else "AUCUN lien social (red flag — pénaliser)"
+        age_min_approx = t.get("age_hours", 0) * 60
+        if has_socials:
+            socials_str = f"Twitter={twitter or 'non'} | TG={telegram or 'non'} | Site={website or 'non'}"
+        elif age_min_approx < 20:
+            socials_str = "Aucun social (token < 20min — normal à ce stade, NE PAS pénaliser)"
+        else:
+            socials_str = "AUCUN lien social (token > 20min sans socials — red flag, pénaliser)"
+        # Description absente
+        desc_str = description if description else (
+            "Aucune description (token très frais — NE PAS sur-pénaliser si < 15min)"
+            if age_min_approx < 15 else "AUCUNE description (red flag)"
         )
-        # Description absente = vrai red flag
-        desc_str = description if description else "AUCUNE description (red flag — pénaliser)"
 
         prompt = """Tu es un expert en analyse de memecoins sur Pump.fun (Solana). Tu dois scorer ce token de 0 à 100.
 
@@ -1620,8 +1652,9 @@ Volume vs MC, bonding curve progression, replies récents.
             desc_str,
         )
 
-        # ── Appel API Anthropic ───────────────────────────────
-        try:
+        # ── Appel API Anthropic (limité à 3 simultanés) ─────────
+        async with self._claude_sem:
+          try:
             headers = {
                 "x-api-key":         self.anthropic_key,
                 "anthropic-version": "2023-06-01",
@@ -1644,28 +1677,27 @@ Volume vs MC, bonding curve progression, replies récents.
                         logger.error("Claude API %d: %s", r.status, body[:200])
                         return {"score": 0, "verdict": "Erreur API Claude", "breakdown": {}, "recommendation": "SKIP"}
 
-                    data    = await r.json()
-                    content = data.get("content", [{}])[0].get("text", "")
+                    data       = await r.json()
+                    raw_text   = data.get("content", [{}])[0].get("text", "")
 
-                    # Parser le JSON retourné par Claude
-                    clean = content.strip()
-                    if clean.startswith("```"):
-                        clean = clean.split("```")[1]
-                        if clean.startswith("json"):
-                            clean = clean[4:]
-                    clean = clean.strip()
+                    # Parser JSON robuste — cherche le premier { et le dernier }
+                    # Résistant aux textes parasites avant/après le JSON
+                    result = self._parse_claude_json(raw_text)
+                    if result is None:
+                        logger.error("JSON parse error Claude %s | raw: %s", symbol, raw_text[:300])
+                        return {"score": 0, "verdict": "Erreur parsing réponse", "breakdown": {}, "recommendation": "SKIP"}
 
-                    result = json.loads(clean)
+                    score = int(result.get("score", 0))
                     logger.info(
                         "Score Claude %s (%s): %d/100 — %s",
-                        symbol, addr[:8], result.get("score", 0), result.get("verdict", "")
+                        symbol, addr[:8], score, result.get("verdict", "")
                     )
                     return result
 
-        except json.JSONDecodeError as e:
-            logger.error("JSON parse error Claude: %s | response: %s", e, content[:200])
+          except json.JSONDecodeError as e:
+            logger.error("JSON parse error Claude: %s", e)
             return {"score": 0, "verdict": "Erreur parsing réponse", "breakdown": {}, "recommendation": "SKIP"}
-        except Exception as e:
+          except Exception as e:
             logger.error("Erreur appel Claude: %s", e)
             return {"score": 0, "verdict": "Erreur API", "breakdown": {}, "recommendation": "SKIP"}
 

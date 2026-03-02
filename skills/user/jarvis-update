@@ -1,0 +1,8 @@
+# /etc/sudoers.d/jarvis-update
+# Permet à l'utilisateur 'pi' de redémarrer/voir le service JARVIS sans mot de passe.
+# Installe avec : sudo cp jarvis-update /etc/sudoers.d/ && sudo chmod 440 /etc/sudoers.d/jarvis-update
+
+pi ALL=(ALL) NOPASSWD: /bin/systemctl restart jarvis
+pi ALL=(ALL) NOPASSWD: /bin/systemctl start jarvis
+pi ALL=(ALL) NOPASSWD: /bin/systemctl stop jarvis
+pi ALL=(ALL) NOPASSWD: /bin/systemctl status jarvis

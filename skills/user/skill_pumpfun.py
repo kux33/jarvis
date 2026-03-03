@@ -117,6 +117,7 @@ class PumpFunSkill(BaseSkill):
         "pumppaperreset": "Remettre à zéro le paper trading",
         "pumpconfig":     "Voir/modifier la config trading",
         "pumpscanlog":    "Log détaillé des scans (`/pumpscanlog [N]`)",
+        "pumpwallet":     "Balance SOL du wallet + clé publique",
     }
 
     # ── Init ────────────────────────────────────────────────────
@@ -259,6 +260,7 @@ class PumpFunSkill(BaseSkill):
             "pumppaperreset": self._cmd_paper_reset,
             "pumpconfig":     self._cmd_config,
             "pumpscanlog":    self._cmd_scanlog,
+            "pumpwallet":     self._cmd_wallet,
         }
         handler = routes.get(command)
         if handler:
@@ -2872,6 +2874,52 @@ Volume vs MC, bonding curve progression, replies récents.
             logger.error("sign_and_send_transaction: %s", e)
             return None
 
+
+    async def _cmd_wallet(self, args: str, ctx: SkillContext) -> str:
+        """Affiche la balance SOL du wallet + cle publique : /pumpwallet"""
+        public_key = self._get_public_key()
+        out = ["💳 **Wallet Solana**\n━━━━━━━━━━━━━━━"]
+
+        if not public_key:
+            out.append(
+                "❌ Clé publique introuvable\n"
+                "Vérifie `PUMP_WALLET_PUBLIC_KEY` ou `PUMP_WALLET_KEY` dans `.env`"
+            )
+            return "\n".join(out)
+
+        out.append("`%s`" % public_key)
+
+        # Balance SOL
+        balance   = await self._get_wallet_sol_balance()
+        sol_price = await self._get_sol_price()
+        bal_usd   = balance * sol_price if sol_price > 0 else 0
+
+        if balance == 0.0 and not self.wallet_pubkey and not self.wallet_key:
+            out.append("⚠️ Impossible de lire le solde — wallet non configuré")
+        elif balance == 0.0:
+            out.append("⚠️ Balance : **0.0000 SOL** (RPC timeout ou wallet vide)")
+            out.append("RPC utilisé : `%s`" % self.solana_rpc.replace("https://","")[:50])
+        else:
+            out.append("💰 Balance : **%.4f SOL** (~$%.2f)" % (balance, bal_usd))
+
+        # Capital engagé
+        if self._positions and sol_price > 0:
+            engaged_usd = sum(p.get("amount_usd", 0) for p in self._positions.values())
+            engaged_sol = engaged_usd / sol_price
+            libre       = balance - engaged_sol - 0.05
+            out.append("📊 Engagé  : **%.4f SOL** ($%.2f — %d positions)" % (
+                engaged_sol, engaged_usd, len(self._positions)))
+            out.append("🟢 Libre   : **%.4f SOL** (après réserve fees 0.05 SOL)" % libre)
+        else:
+            out.append("🟢 Libre   : **%.4f SOL** (après réserve fees 0.05 SOL)" % max(0, balance - 0.05))
+
+        # Infos réseau
+        rpc_short = self.solana_rpc.replace("https://", "").split("/")[0][:45]
+        out.append("\n🔌 RPC : `%s`" % rpc_short)
+        out.append("🔗 https://solscan.io/account/%s" % public_key)
+
+        return "\n".join(out)
+
     async def _cmd_scanlog(self, args: str, ctx: SkillContext) -> str:
         """Affiche le log détaillé des scans : /pumpscanlog [N=10]"""
         try:
@@ -2946,17 +2994,7 @@ Volume vs MC, bonding curve progression, replies récents.
     def _save_state(self):
         try:
             state = {
-                "scan_interval":   self.scan_interval,
-                "mc_min":          self.mc_min,
-                "mc_max":          self.mc_max,
-                "volume_min":      self.volume_min,
-                "holders_min":     self.holders_min,
-                "snipers_max":     self.snipers_max,
-                "dev_hold_max":    self.dev_hold_max,
-                "top10_max":       self.top10_max,
-                "age_max_hours":   self.age_max_hours,
-                "score_alert":     self.score_alert,
-                "score_high":      self.score_high,
+                # Runtime uniquement — les paramètres config sont dans le .env
                 "blacklist":       list(self._blacklist),
                 "alerts_log":      self._alerts_log[-100:],
                 "scan_count":      self._scan_count,
@@ -2992,39 +3030,22 @@ Volume vs MC, bonding curve progression, replies récents.
             with open("/tmp/jarvis_pumpfun_state.json") as f:
                 state = json.load(f)
             self.scan_interval   = state.get("scan_interval",  self.scan_interval)
-            self.mc_min          = state.get("mc_min",         self.mc_min)
-            self.mc_max          = state.get("mc_max",         self.mc_max)
-            self.volume_min      = state.get("volume_min",     self.volume_min)
-            self.holders_min     = state.get("holders_min",    self.holders_min)
-            self.snipers_max     = state.get("snipers_max",    self.snipers_max)
-            self.dev_hold_max    = state.get("dev_hold_max",   self.dev_hold_max)
-            self.top10_max       = state.get("top10_max",      self.top10_max)
-            self.age_max_hours   = state.get("age_max_hours",  self.age_max_hours)
-            self.score_alert     = state.get("score_alert",    self.score_alert)
-            self.score_high      = state.get("score_high",     self.score_high)
+            # ── Données runtime uniquement (PAS les paramètres de config) ──
+            # Le .env a toujours la priorité absolue sur les paramètres.
+            # Le state JSON ne restaure que les données dynamiques :
+            # positions ouvertes, historique trades, PnL, blacklist, compteurs.
             self._blacklist      = set(state.get("blacklist",  []))
             self._alerts_log     = state.get("alerts_log",     [])
             self._scan_count     = state.get("scan_count",     0)
-            # Trading
-            self.trade_mode      = state.get("trade_mode",     self.trade_mode)
-            self.buy_amount      = state.get("buy_amount",     self.buy_amount)
-            self.buy_amount_high = state.get("buy_amount_high", self.buy_amount_high)
-            self.buy_score_min   = state.get("buy_score_min",  self.buy_score_min)
-            self.buy_score_high  = state.get("buy_score_high", self.buy_score_high)
-            self.tp1             = state.get("tp1",            self.tp1)
-            self.tp2             = state.get("tp2",            self.tp2)
-            self.tp3             = state.get("tp3",            self.tp3)
-            self.sl              = state.get("sl",             self.sl)
-            self.max_open_trades = state.get("max_open_trades", self.max_open_trades)
-            self.max_daily_loss  = state.get("max_daily_loss", self.max_daily_loss)
             self._positions      = state.get("positions",      {})
             self._closed_trades  = state.get("closed_trades",  [])
             self._total_pnl      = state.get("total_pnl",      0.0)
             self._daily_pnl      = state.get("daily_pnl",      0.0)
             self._daily_pnl_date = state.get("daily_pnl_date", "")
-            # Note: scored details non persistés (trop lourd), juste les méta
-            saved_scan_log = state.get("scan_log", [])
-            self._scan_log = [{**s, "scored": []} for s in saved_scan_log]
+            saved_scan_log       = state.get("scan_log",       [])
+            self._scan_log       = [{**s, "scored": []} for s in saved_scan_log]
+            # Note: tous les paramètres (mc_min, score_alert, buy_score_min, etc.)
+            # sont chargés exclusivement depuis le .env dans __init__.
         except FileNotFoundError:
             pass
         except Exception as e:

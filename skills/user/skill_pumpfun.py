@@ -117,7 +117,6 @@ class PumpFunSkill(BaseSkill):
         "pumppaperreset": "Remettre à zéro le paper trading",
         "pumpconfig":     "Voir/modifier la config trading",
         "pumpscanlog":    "Log détaillé des scans (`/pumpscanlog [N]`)",
-        "pumpwallet":     "Balance SOL du wallet + clé publique",
     }
 
     # ── Init ────────────────────────────────────────────────────
@@ -260,7 +259,6 @@ class PumpFunSkill(BaseSkill):
             "pumppaperreset": self._cmd_paper_reset,
             "pumpconfig":     self._cmd_config,
             "pumpscanlog":    self._cmd_scanlog,
-            "pumpwallet":     self._cmd_wallet,
         }
         handler = routes.get(command)
         if handler:
@@ -2108,9 +2106,26 @@ Volume vs MC, bonding curve progression, replies récents.
                 )
             )
 
-        parts = args.split()
+
+        parts = args.split(maxsplit=2)
+
+        # ── Sous-commande env : écrire dans le .env ─────────────
+        # Usage : /pumpconfig env PUMP_WALLET_PUBLIC_KEY AbCd1234...
+        if len(parts) >= 2 and parts[0].lower() == "env":
+            if len(parts) < 3:
+                return (
+                    "Usage : `/pumpconfig env CLE valeur`\n"
+                    "Ex: `/pumpconfig env PUMP_WALLET_PUBLIC_KEY AbCd123`\n"
+                    "Ex: `/pumpconfig env PUMP_BUY_SCORE_MIN 60`\n\n"
+                    "⚠️ Écrit directement dans le fichier `.env` — redémarrage non requis."
+                )
+            env_key = parts[1].strip().upper()
+            env_val = parts[2].strip()
+            return await self._cmd_config_env(env_key, env_val)
+
+        # ── Modification paramètre runtime ──────────────────────
         if len(parts) != 2:
-            return "Usage: `/pumpconfig <clé> <valeur>`"
+            return "Usage: `/pumpconfig <clé> <valeur>` ou `/pumpconfig env <CLÉ> <valeur>`"
 
         key, val_str = parts
         config_map = {
@@ -2126,12 +2141,15 @@ Volume vs MC, bonding curve progression, replies récents.
             "max_daily_loss":  ("max_daily_loss",   float),
         }
         if key not in config_map:
-            return "❌ Clé inconnue. `/pumpconfig` pour voir les clés disponibles."
+            return (
+                "❌ Clé inconnue : `%s`\n"
+                "`/pumpconfig` pour voir les clés disponibles.\n"
+                "Pour une variable .env : `/pumpconfig env PUMP_XXX valeur`" % key
+            )
 
         attr, cast = config_map[key]
         try:
             val = cast(val_str)
-            # Normaliser sl (accepter 50 = 50% ou 0.50)
             if key == "sl" and val > 1:
                 val = val / 100
             setattr(self, attr, val)
@@ -2139,6 +2157,138 @@ Volume vs MC, bonding curve progression, replies récents.
             return "✅ **%s** → `%s`" % (key, val_str)
         except ValueError:
             return "❌ Valeur invalide : `%s`" % val_str
+
+    async def _cmd_config_env(self, key: str, value: str) -> str:
+        """
+        Écrit ou met à jour une clé dans le fichier .env.
+        Recharge la variable en mémoire si elle est connue de la skill.
+        """
+        import re as _re
+
+        # Trouver le .env — remonte depuis ce fichier jusqu'à trouver le .env du projet
+        env_path = None
+        search = Path(__file__).parent
+        for _ in range(5):
+            candidate = search / ".env"
+            if candidate.exists():
+                env_path = candidate
+                break
+            search = search.parent
+
+        if env_path is None:
+            return (
+                "❌ Fichier `.env` introuvable\n"
+                "Cherché depuis `%s` (5 niveaux)" % Path(__file__).parent
+            )
+
+        # Lire le contenu actuel
+        try:
+            with open(env_path, "r") as f:
+                lines = f.readlines()
+        except Exception as e:
+            return "❌ Impossible de lire `.env` : %s" % e
+
+        # Valeur à écrire (entourer de guillemets si contient des espaces)
+        safe_val = ('"%s"' % value) if " " in value else value
+        new_line = "%s=%s\n" % (key, safe_val)
+
+        # Chercher si la clé existe déjà
+        found = False
+        old_val = None
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            if _re.match(r"^%s\s*=" % _re.escape(key), stripped):
+                # Extraire l'ancienne valeur pour l'afficher
+                old_val = stripped.split("=", 1)[1].strip().strip('"').strip("'")
+                lines[i] = new_line
+                found = True
+                break
+
+        if not found:
+            # Ajouter à la fin
+            if lines and not lines[-1].endswith("\n"):
+                lines.append("\n")
+            lines.append(new_line)
+
+        # Écrire le fichier
+        try:
+            with open(env_path, "w") as f:
+                f.writelines(lines)
+        except Exception as e:
+            return "❌ Impossible d'écrire dans `.env` : %s" % e
+
+        # Recharger la variable en mémoire pour les clés connues
+        os.environ[key] = value
+        reload_msg = self._reload_env_key(key, value)
+
+        action = "mis à jour" if found else "ajouté"
+        msg = (
+            "✅ **`.env` %s**\n"
+            "`%s` = `%s`" % (action, key, value[:60] + ("..." if len(value) > 60 else ""))
+        )
+        if found and old_val:
+            msg += "\n_(ancienne valeur : `%s`)_" % (old_val[:40] + ("..." if len(old_val) > 40 else ""))
+        if reload_msg:
+            msg += "\n%s" % reload_msg
+        msg += "\n\n📁 `%s`" % env_path
+
+        return msg
+
+    def _reload_env_key(self, key: str, value: str) -> str:
+        """
+        Recharge en mémoire une variable .env connue sans redémarrage.
+        Retourne un message indiquant ce qui a été rechargé, ou "" si clé inconnue.
+        """
+        reloaded = []
+        try:
+            if key == "PUMP_WALLET_PUBLIC_KEY":
+                self.wallet_pubkey = value
+                reloaded.append("wallet_pubkey rechargé")
+            elif key == "PUMP_WALLET_KEY":
+                self.wallet_key    = value
+                self.wallet_pubkey = ""  # forcer re-dérivation
+                reloaded.append("wallet_key rechargé (clé publique sera re-dérivée)")
+            elif key == "PUMP_SOLANA_RPC":
+                self.solana_rpc = value
+                reloaded.append("solana_rpc rechargé")
+            elif key == "PUMP_TRADE_MODE":
+                self.trade_mode = value
+                reloaded.append("trade_mode rechargé → %s" % value)
+            elif key == "PUMP_BUY_AMOUNT":
+                self.buy_amount = float(value)
+                reloaded.append("buy_amount rechargé → $%.0f" % self.buy_amount)
+            elif key == "PUMP_BUY_AMOUNT_HIGH":
+                self.buy_amount_high = float(value)
+                reloaded.append("buy_amount_high rechargé → $%.0f" % self.buy_amount_high)
+            elif key == "PUMP_BUY_SCORE_MIN":
+                self.buy_score_min = int(value)
+                reloaded.append("buy_score_min rechargé → %d/100" % self.buy_score_min)
+            elif key == "PUMP_BUY_SCORE_HIGH":
+                self.buy_score_high = int(value)
+                reloaded.append("buy_score_high rechargé → %d/100" % self.buy_score_high)
+            elif key == "PUMP_SCORE_ALERT":
+                self.score_alert = int(value)
+                reloaded.append("score_alert rechargé → %d/100" % self.score_alert)
+            elif key == "PUMP_MC_MIN":
+                self.mc_min = float(value)
+                reloaded.append("mc_min rechargé → $%.0f" % self.mc_min)
+            elif key == "PUMP_MC_MAX":
+                self.mc_max = float(value)
+                reloaded.append("mc_max rechargé → $%.0f" % self.mc_max)
+            elif key == "ANTHROPIC_API_KEY":
+                self.anthropic_key = value
+                reloaded.append("anthropic_key rechargé")
+            elif key == "MORALIS_API_KEY":
+                self.moralis_key = value
+                reloaded.append("moralis_key rechargé")
+        except (ValueError, TypeError) as e:
+            return "⚠️ Variable écrite dans .env mais rechargement en mémoire échoué : %s" % e
+
+        if reloaded:
+            return "🔄 Rechargé en mémoire : %s" % " | ".join(reloaded)
+        return "💡 Redémarre JARVIS pour appliquer cette variable (`/update` ou `sudo systemctl restart jarvis`)"
 
     # ══════════════════════════════════════════════════════════════
     #   MOTEUR DE TRADING AUTOMATIQUE
@@ -2873,52 +3023,6 @@ Volume vs MC, bonding curve progression, replies récents.
         except Exception as e:
             logger.error("sign_and_send_transaction: %s", e)
             return None
-
-
-    async def _cmd_wallet(self, args: str, ctx: SkillContext) -> str:
-        """Affiche la balance SOL du wallet + cle publique : /pumpwallet"""
-        public_key = self._get_public_key()
-        out = ["💳 **Wallet Solana**\n━━━━━━━━━━━━━━━"]
-
-        if not public_key:
-            out.append(
-                "❌ Clé publique introuvable\n"
-                "Vérifie `PUMP_WALLET_PUBLIC_KEY` ou `PUMP_WALLET_KEY` dans `.env`"
-            )
-            return "\n".join(out)
-
-        out.append("`%s`" % public_key)
-
-        # Balance SOL
-        balance   = await self._get_wallet_sol_balance()
-        sol_price = await self._get_sol_price()
-        bal_usd   = balance * sol_price if sol_price > 0 else 0
-
-        if balance == 0.0 and not self.wallet_pubkey and not self.wallet_key:
-            out.append("⚠️ Impossible de lire le solde — wallet non configuré")
-        elif balance == 0.0:
-            out.append("⚠️ Balance : **0.0000 SOL** (RPC timeout ou wallet vide)")
-            out.append("RPC utilisé : `%s`" % self.solana_rpc.replace("https://","")[:50])
-        else:
-            out.append("💰 Balance : **%.4f SOL** (~$%.2f)" % (balance, bal_usd))
-
-        # Capital engagé
-        if self._positions and sol_price > 0:
-            engaged_usd = sum(p.get("amount_usd", 0) for p in self._positions.values())
-            engaged_sol = engaged_usd / sol_price
-            libre       = balance - engaged_sol - 0.05
-            out.append("📊 Engagé  : **%.4f SOL** ($%.2f — %d positions)" % (
-                engaged_sol, engaged_usd, len(self._positions)))
-            out.append("🟢 Libre   : **%.4f SOL** (après réserve fees 0.05 SOL)" % libre)
-        else:
-            out.append("🟢 Libre   : **%.4f SOL** (après réserve fees 0.05 SOL)" % max(0, balance - 0.05))
-
-        # Infos réseau
-        rpc_short = self.solana_rpc.replace("https://", "").split("/")[0][:45]
-        out.append("\n🔌 RPC : `%s`" % rpc_short)
-        out.append("🔗 https://solscan.io/account/%s" % public_key)
-
-        return "\n".join(out)
 
     async def _cmd_scanlog(self, args: str, ctx: SkillContext) -> str:
         """Affiche le log détaillé des scans : /pumpscanlog [N=10]"""

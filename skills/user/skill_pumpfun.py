@@ -118,6 +118,7 @@ class PumpFunSkill(BaseSkill):
         "pumppaperreset": "Remettre à zéro le paper trading",
         "pumpconfig":     "Voir/modifier la config trading",
         "pumpscanlog":    "Log détaillé des scans (`/pumpscanlog [N]`)",
+        "pumpwallet":     "Balance SOL du wallet + clé publique",
     }
 
     # ── Init ────────────────────────────────────────────────────
@@ -260,6 +261,7 @@ class PumpFunSkill(BaseSkill):
             "pumppaperreset": self._cmd_paper_reset,
             "pumpconfig":     self._cmd_config,
             "pumpscanlog":    self._cmd_scanlog,
+            "pumpwallet":     self._cmd_wallet,
         }
         handler = routes.get(command)
         if handler:
@@ -2217,6 +2219,20 @@ Volume vs MC, bonding curve progression, replies récents.
         try:
             with open(env_path, "w") as f:
                 f.writelines(lines)
+        except PermissionError:
+            import subprocess as _sp
+            try:
+                current_user = _sp.check_output(["whoami"], text=True).strip()
+                owner = _sp.check_output(["stat", "-c", "%U", str(env_path)], text=True).strip()
+            except Exception:
+                current_user, owner = "?", "?"
+            return (
+                "❌ **Permission refusée sur `.env`**\n"
+                "JARVIS tourne en `%s`, le fichier appartient à `%s`\n\n"
+                "**Fix sur le RPI :**\n"
+                "`sudo chown %s:%s %s && chmod 600 %s`"
+                % (current_user, owner, current_user, current_user, env_path, env_path)
+            )
         except Exception as e:
             return "❌ Impossible d'écrire dans `.env` : %s" % e
 
@@ -3024,6 +3040,45 @@ Volume vs MC, bonding curve progression, replies récents.
         except Exception as e:
             logger.error("sign_and_send_transaction: %s", e)
             return None
+
+    async def _cmd_wallet(self, args: str, ctx: SkillContext) -> str:
+        """Balance SOL du wallet : /pumpwallet"""
+        public_key = self._get_public_key()
+        out = ["💳 **Wallet Solana**\n━━━━━━━━━━━━━━━"]
+
+        if not public_key:
+            out.append(
+                "❌ Clé publique introuvable\n"
+                "Utilise `/pumpconfig env PUMP_WALLET_PUBLIC_KEY TonAdresse`"
+            )
+            return "\n".join(out)
+
+        out.append("`%s`" % public_key)
+
+        balance   = await self._get_wallet_sol_balance()
+        sol_price = await self._get_sol_price()
+        bal_usd   = balance * sol_price if sol_price > 0 else 0
+
+        if balance == 0.0:
+            out.append("⚠️ Balance : **0.0000 SOL** — RPC timeout ou wallet vide")
+            out.append("RPC : `%s`" % self.solana_rpc.replace("https://", "")[:50])
+        else:
+            out.append("💰 Balance : **%.4f SOL** (~$%.2f)" % (balance, bal_usd))
+
+        if self._positions and sol_price > 0:
+            engaged_usd = sum(p.get("amount_usd", 0) for p in self._positions.values())
+            engaged_sol = engaged_usd / sol_price
+            libre       = balance - engaged_sol - 0.05
+            out.append("📊 Engagé  : **%.4f SOL** ($%.2f — %d positions)" % (
+                engaged_sol, engaged_usd, len(self._positions)))
+            out.append("🟢 Libre   : **%.4f SOL** (après réserve fees 0.05)" % libre)
+        else:
+            out.append("🟢 Libre   : **%.4f SOL** (après réserve fees 0.05)" % max(0, balance - 0.05))
+
+        rpc_short = self.solana_rpc.replace("https://", "").split("/")[0][:45]
+        out.append("\n🔌 RPC : `%s`" % rpc_short)
+        out.append("🔗 https://solscan.io/account/%s" % public_key)
+        return "\n".join(out)
 
     async def _cmd_scanlog(self, args: str, ctx: SkillContext) -> str:
         """Affiche le log détaillé des scans : /pumpscanlog [N=10]"""

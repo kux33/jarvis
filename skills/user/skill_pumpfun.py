@@ -2131,6 +2131,12 @@ Volume vs MC, bonding curve progression, replies récents.
             return "Usage: `/pumpconfig <clé> <valeur>` ou `/pumpconfig env <CLÉ> <valeur>`"
 
         key, val_str = parts
+
+        # Auto-détection : si la clé ressemble à une var d'env (majuscules/underscore)
+        # on route vers env sans que l'utilisateur ait besoin de taper "env"
+        if key == key.upper() and "_" in key:
+            return await self._cmd_config_env(key, val_str)
+
         config_map = {
             "buy_amount":      ("buy_amount",      float),
             "buy_amount_high": ("buy_amount_high",  float),
@@ -2147,7 +2153,8 @@ Volume vs MC, bonding curve progression, replies récents.
             return (
                 "❌ Clé inconnue : `%s`\n"
                 "`/pumpconfig` pour voir les clés disponibles.\n"
-                "Pour une variable .env : `/pumpconfig env PUMP_XXX valeur`" % key
+                "Pour une variable .env : `/pumpconfig env PUMP_XXX valeur`\n"
+                "  ou directement : `/pumpconfig PUMP_XXX valeur`" % key
             )
 
         attr, cast = config_map[key]

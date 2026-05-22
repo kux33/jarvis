@@ -30,6 +30,9 @@ base58>=2.1.0              # Encoder/décoder clés Solana
 # ──────────────────────────────────────────────────
 py-clob-client>=0.14.0     # API Polymarket CLOB (ordres, positions)
 web3>=6.0.0                # Signature Ethereum pour Polymarket
+eth-account>=0.11.0        # Wallet EVM + signature EIP-712 (skill_hyperliquid)
+msgpack>=1.0.0             # Sérialisation msgpack (skill_hyperliquid)
+hyperliquid-python-sdk>=0.8.0  # SDK officiel Hyperliquid (ordres, signature)
 
 # ──────────────────────────────────────────────────
 # Système & Monitoring
